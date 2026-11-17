@@ -1,0 +1,9 @@
+settings.json
+desk.db
+logs/
+site/
+__pycache__/
+*.pyc
+*.db
+.env
+.desk_secrets/
