@@ -30,7 +30,11 @@ def find_coin(x):
     r = db.q("select * from coins where mint=? or lower(symbol)=lower(?) or lower(name)=lower(?) order by migrated_at desc", (x, x, x), True)
     return r
 def status_text():
-    s = config.load(); from agents.executor import stack
+    s = config.load()
+    if not s.get("legacy_pipeline"):
+        from agents import winners, gems
+        return (f"{s['mode']} · alerts-only (winners + gems)\n" + winners.text() + "\n\n" + gems.text())
+    from agents.executor import stack
     op = db.q("select name,size,entry,mint from positions where status in ('open','exiting')")
     paused = [a for a in AGENTS if db.kv_get(f"paused:{a}")]
     return (f"{s['mode']} · stack ${stack(s):.2f}" + (f" · free ${db.kv_get('paper_balance', s['paper_balance']):.2f}" if s['mode']=='PAPER' else "") +
@@ -55,8 +59,21 @@ def why(x):
     if p: lines.append(f"Position: {p['status']} entry {p['entry']} size ${p['size']}" + (f" exit {p['exit_reason']} pnl ${p['pnl']}" if p['exit_reason'] else ""))
     return "\n".join(lines), m
 def report_text():
-    s = config.load(); from agents.executor import stack
-    since = time.time() - 24*3600
+    s = config.load(); since = time.time() - 24*3600
+    if not s.get("legacy_pipeline"):
+        from agents import winners, gems
+        top = db.q("select name,max_mult,ath_mc,rug from winner_coins where coalesce(rank,0)>0 and coalesce(rug,0)=0 order by rank")
+        rugs = db.q("select name,peak_liq,last_liq from gem_rugs where ts>?", (since,))
+        gems_n = db.q("select count(*) n from gem_scores where ts>?", (since,), True)["n"]
+        links_n = db.q("select count(distinct addr) n from winner_roles", one=True)["n"]
+        lines = [f"{'PAPER · ' if s['mode']=='PAPER' else ''}Report · alerts-only (winners + gems)",
+                 f"{len(top)} in the top-10 · {links_n} linked wallets · {gems_n} gems scored last 24h · {len(rugs)} rugs",
+                 winners.text()]
+        for r in rugs:
+            lines.append(f"  RUG {r['name']} · liq ${r['peak_liq'] or 0:,.0f} → ${r['last_liq'] or 0:,.2f}")
+        lines.append(gems.text())
+        return "\n".join(lines)
+    from agents.executor import stack
     cl = db.q("select * from positions where closed_at>? ", (since,))
     pnl = sum(p["pnl"] or 0 for p in cl); w = sum(1 for p in cl if (p["pnl"] or 0) > 0)
     k = db.q("select count(*) n from coins where migrated_at>?", (since,), True)["n"]
@@ -170,6 +187,7 @@ def daily(s):
 def loop(stop):
     off = db.kv_get("tg_offset", 0)
     while not stop.is_set():
+        db.beat("desk")
         try: daily(config.load())
         except Exception as e: log.info(f"report err {e}")
         try:

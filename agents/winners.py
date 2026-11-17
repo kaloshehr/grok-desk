@@ -1,13 +1,12 @@
 """Wallet-cluster tracker (PAPER, read-only). Never places orders or touches funds.
 
-Every few minutes: find recent pump.fun-origin coins that exploded (>=10x or MC >= $500k
-within ~24h) via DexScreener / GeckoTerminal, then on-chain (budgeted RPC) pull the dev,
-early buyers, and the SOL funder of those wallets. Wallets sharing a funder become a cluster.
-Scores separate repeatable winners from dumpers/ruggers. New PumpPortal tokens whose creator
-or early buyers match a good cluster get a Telegram alert and enter the normal Scanner ->
-Auditor -> Analyst -> Executor -> Risk PAPER path (ZŁY is still never bought).
+Every ~20 minutes take the top 10 exploded pump.fun-origin coins (by multiplier / ATH MC
+in ~24h) and fully map linked wallets: dev, snipers/early buyers, funders, and early
+holders who profited. RPC budget is spent mainly on those 10 (deeper, cached walks).
+New PumpPortal tokens and new pairs are watched; if a mapped address appears as creator,
+early buyer, or funder, a Telegram alert names the address and the exploded coin it came from.
 """
-import json, time, threading, collections, requests, db, util, config, notifier, links
+import json, time, threading, collections, requests, asyncio, db, util, config, notifier, links
 log = util.logger("winners")
 
 PUMP_API = ("https://frontend-api-v3.pump.fun/coins/", "https://frontend-api.pump.fun/coins/")
@@ -152,39 +151,57 @@ def _keys(tx):
     for a in meta.get("loadedAddresses", {}).get("readonly") or []: out.append(a)
     return out
 
-def _first_buyers(addr, launched, s):
-    """Earliest unique buyers on a pool or bonding-curve account. Budget-capped."""
-    if not addr: return []
+def _first_buyers(addr, launched, s, deep=False, cursor=None):
+    """Earliest unique buyers on a pool or bonding-curve account.
+    Shallow: skip hot pools. Deep (top-10): page back toward launch, resumable via cursor.
+    Returns (buyers, state) where state has before/done/reached."""
+    empty = ([], {"before": cursor, "done": True, "reached": False})
+    if not addr: return empty
     window = s["win_early_window_s"]; need = s["win_early_n"]
-    sigs, before, pages = [], None, 0
+    max_pages = int(s.get("win_deep_pages", 15) if deep else 2)
+    sigs, before, pages = [], cursor, 0
     oldest_needed = (launched or 0) - 30
+    reached = False
     try:
         db.beat("winners")
-        batch = util.research_rpc("getSignaturesForAddress", [addr, {"limit": 200}], ttl=45) or []
-        if not batch: return []
+        args = {"limit": 200}
+        if before: args["before"] = before
+        batch = util.research_rpc("getSignaturesForAddress", [addr, args], ttl=3600 if before else 60) or []
+        if not batch:
+            return [], {"before": before, "done": True, "reached": False}
         last_t = batch[-1].get("blockTime") or 0
-        # hot / old pools: newest 200 txs are already far past the 30s sniper window — don't burn the RPC budget walking back
-        if launched and last_t and last_t > launched + max(window, 120):
+        if not deep and launched and last_t and last_t > launched + max(window, 120) and not before:
             log.info(f"skip early-buyer walk {addr[:6]} (oldest sig in last 200 is {int(last_t-launched)}s after launch)")
-            return []
+            return [], {"before": None, "done": True, "reached": False}
         sigs.extend(batch)
-        while pages < 2 and last_t and last_t > oldest_needed and len(batch) == 200:
+        while pages < max_pages and last_t and last_t > oldest_needed and len(batch) == 200:
             before = batch[-1]["signature"]; pages += 1
             db.beat("winners")
-            batch = util.research_rpc("getSignaturesForAddress", [addr, {"limit": 200, "before": before}], ttl=45) or []
+            batch = util.research_rpc("getSignaturesForAddress", [addr, {"limit": 200, "before": before}], ttl=6*3600) or []
             if not batch: break
             sigs.extend(batch)
             last_t = batch[-1].get("blockTime") or 0
+        if last_t and launched and last_t <= oldest_needed + window:
+            reached = True
+        if len(batch) < 200:
+            reached = True
+        done = reached or (not deep)
+        before = batch[-1]["signature"] if batch and not reached else None
     except Exception as e:
-        log.info(f"sigs {type(e).__name__}"); return []
+        log.info(f"sigs {type(e).__name__}"); return [], {"before": cursor, "done": False, "reached": False}
     early = []
     for x in reversed(sigs):  # oldest first
         bt = x.get("blockTime") or 0
         if x.get("err"): continue
         if launched and bt and bt < launched - 15: continue
-        if launched and bt and bt > launched + window and len(early) >= 3: break
+        if launched and bt and bt > launched + window and len(early) >= (need if deep else 3):
+            if reached or not deep: break
+            # deep walk not yet at launch: don't treat mid-history as snipers
+            early = []; break
+        if launched and bt and bt > launched + window and not reached and deep:
+            continue
         early.append(x)
-        if len(early) >= need * 2: break
+        if len(early) >= need * (3 if deep else 2): break
     buyers, seen = [], set()
     for x in early:
         try:
@@ -203,8 +220,9 @@ def _first_buyers(addr, launched, s):
             post = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
             if post > pre.get(owner, 0):
                 seen.add(owner); buyers.append({"addr": owner, "ts": bt, "mint": b.get("mint")})
-                if len(buyers) >= need: return buyers
-    return buyers
+                if len(buyers) >= need: 
+                    return buyers, {"before": before, "done": done, "reached": reached}
+    return buyers, {"before": before, "done": done, "reached": reached}
 
 def _funder(addr):
     cached = db.q("select json from winner_wallets where addr=?", (addr,), True)
@@ -261,6 +279,26 @@ def _is_rug(pair, ath_mc):
     if liq <= 0 and (pair.get("dexId") != "pumpfun"): return True
     return False
 
+def mark_rug(mint, creator=None, name=None, why=""):
+    """Record a rug outcome on the coin and penalize the creator/cluster. Safe to call twice."""
+    row = db.q("select rug,creator from winner_coins where mint=?", (mint,), True)
+    if row:
+        db.q("update winner_coins set rug=1,status='rug' where mint=?", (mint,))
+        creator = creator or row["creator"]
+    else:
+        db.q("insert or ignore into winner_coins(mint,name,creator,found_at,status,rug,analyzed,json) values(?,?,?,?, 'rug',1,0,?)",
+             (mint, name, creator, time.time(), json.dumps({"why": why})))
+        if creator:
+            db.q("update winner_coins set creator=coalesce(creator,?) where mint=?", (creator, mint))
+    if creator:
+        db.q("insert or ignore into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)",
+             (creator, "dev", time.time(), json.dumps({})))
+        db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
+             (mint, creator, "dev", time.time()))
+        try: rebuild_clusters()
+        except Exception as e: log.info(f"mark_rug cluster {type(e).__name__}")
+    log.info(f"RUG {name or mint[:6]} {mint} {why}")
+
 def analyze(row, s):
     mint = row["mint"]
     t0 = time.time()
@@ -289,10 +327,19 @@ def analyze(row, s):
         rug = int(_is_rug(pair, row.get("mc") or 0))
         _save_coin(row, s, creator, rug)
         target = curve or row.get("pool")
-        if target and time.time() - t0 < 25:
-            buyers = _first_buyers(target, row.get("launched") or 0, s)
+        deep = bool(row.get("deep") or s.get("win_deep_pages"))
+        cursor = row.get("walk_before")
+        budget = 180 if deep else 25
+        walk = {"before": cursor, "done": False, "reached": False}
+        if target and time.time() - t0 < budget:
+            buyers, walk = _first_buyers(target, row.get("launched") or 0, s, deep=deep, cursor=cursor)
         elif target:
             log.info(f"{mint[:6]} skip early buyers, {time.time()-t0:.0f}s already spent")
+        try:
+            db.q("update winner_coins set walk_before=?,walk_done=?,mapped_at=? where mint=?",
+                 (walk.get("before"), int(bool(walk.get("done"))), time.time(), mint))
+        except Exception:
+            pass
         addrs = []
         if creator: addrs.append(("dev", creator, row.get("launched") or 0))
         for b in buyers:
@@ -313,7 +360,11 @@ def analyze(row, s):
                 db.q("update winner_wallets set json=? where addr=?", (json.dumps(j), addr))
             db.q("insert or replace into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
                  (mint, addr, role, ts))
+            if f and f not in SYSTEM:
+                db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
+                     (mint, f, "funder", ts))
         _maybe_holds(row.get("pool"), mint)
+        _map_profits(row.get("pool"), mint)
         rebuild_clusters()
     finally:
         db.q("update winner_coins set analyzed=1,creator=coalesce(?,creator),rug=? where mint=?", (creator, rug, mint))
@@ -467,28 +518,181 @@ def _alert(kind, name, mint, score, wins, why):
     except Exception:
         pass
 
+
+def _map_profits(pool, mint):
+    """Mark early wallets that later sold for more than they bought (GeckoTerminal trades)."""
+    if not pool: return
+    try:
+        import gt
+        trades = gt.trades(pool)
+    except Exception:
+        return
+    bought, sold = collections.defaultdict(float), collections.defaultdict(float)
+    first_buy, last_sell = {}, {}
+    for tr in trades:
+        w = tr.get("wallet")
+        if not w: continue
+        usd = float(tr.get("usd") or 0)
+        if tr.get("kind") == "buy":
+            bought[w] += usd
+            first_buy[w] = min(first_buy.get(w, tr.get("ts") or 0) or 0, tr.get("ts") or 0) or (tr.get("ts") or 0)
+        else:
+            sold[w] += usd
+            last_sell[w] = max(last_sell.get(w, 0), tr.get("ts") or 0)
+    for w, s_usd in sold.items():
+        if s_usd >= 20 and s_usd > bought.get(w, 0) * 1.15:
+            hold = None
+            if w in first_buy and last_sell.get(w) and last_sell[w] >= first_buy[w]:
+                hold = last_sell[w] - first_buy[w]
+            db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,?,?,?)",
+                 (mint, w, "profited", first_buy.get(w), last_sell.get(w), hold, round(s_usd - bought.get(w, 0), 2)))
+
+def rank_key(row):
+    return (float(row.get("max_mult") or row.get("mult") or 0), float(row.get("ath_mc") or row.get("mc") or 0))
+
+def pick_top10(s, cands):
+    """Merge fresh candidates with known 24h winners; keep the top N by multiplier, then ATH MC."""
+    n = int(s.get("win_top_n", 10))
+    by = {}
+    cutoff = time.time() - s.get("win_max_age_h", 24) * 3600
+    for r in db.q("select * from winner_coins"):
+        if r["rug"] or r["status"] == "rug": continue
+        if not (r["max_mult"] or r["ath_mc"]): continue
+        launched = r["launched_at"] or r["found_at"] or 0
+        if launched and launched < cutoff: continue
+        by[r["mint"]] = dict(r)
+    for row in cands:
+        if row.get("rug") or row.get("status") == "rug": continue
+        cur = by.get(row["mint"], {})
+        if cur.get("rug") or cur.get("status") == "rug": continue
+        cur.update(row)
+        cur["max_mult"] = max(cur.get("max_mult") or 0, row.get("mult") or 0)
+        cur["ath_mc"] = max(cur.get("ath_mc") or 0, row.get("mc") or 0)
+        by[row["mint"]] = cur
+    ranked = sorted(by.values(), key=rank_key, reverse=True)[:n]
+    db.q("update winner_coins set rank=null")
+    for i, row in enumerate(ranked, 1):
+        db.q("update winner_coins set rank=? where mint=?", (i, row["mint"]))
+        row["rank"] = i
+    return ranked
+
+_idx = [0.0, {}]
+def linked_index():
+    """addr -> list of {mint,name,role,max_mult,rank} from mapped top-10 / analyzed winners."""
+    if time.time() - _idx[0] < 20 and _idx[1]: return _idx[1]
+    out = collections.defaultdict(list)
+    rows = db.q("""select r.addr, r.role, r.mint, c.name, c.max_mult, c.ath_mc, c.rank
+                   from winner_roles r join winner_coins c on c.mint=r.mint
+                   where coalesce(c.rank,0)>0 or c.analyzed=1""")
+    for r in rows:
+        if not r["addr"] or r["addr"] in SYSTEM: continue
+        out[r["addr"]].append({"mint": r["mint"], "name": r["name"], "role": r["role"],
+                               "max_mult": r["max_mult"], "rank": r["rank"]})
+    _idx[0], _idx[1] = time.time(), out
+    return out
+
+def _fmt_hit(addr, recs):
+    recs = recs or []
+    src = recs[0] if recs else {}
+    name = src.get("name") or (src.get("mint") or "")[:6]
+    roles = ",".join(sorted({r.get("role") or "?" for r in recs}))
+    mult = src.get("max_mult") or 0
+    a = f"{addr[:4]}…{addr[-4:]}" if addr and len(addr) > 8 else (addr or "?")
+    return f"{a} · {roles} of {name} ({mult:.0f}x)"
+
+def match_addr(addr, idx=None):
+    if not addr: return []
+    return (idx or linked_index()).get(addr) or []
+
+def _watch_alert(name, mint, hits):
+    """hits: list of (addr, role_on_new_coin, recs). One alert per mint per 6h."""
+    key = f"watch:{mint}"
+    if time.time() - _alerted.get(key, 0) < 6 * 3600: return
+    _alerted[key] = time.time()
+    lines = [f"PAPER · Winners watch: {name or mint[:6]}"]
+    for addr, role, recs in hits[:8]:
+        lines.append("• " + (role + " · " if role else "") + _fmt_hit(addr, recs))
+    lines.append(links.coin_url(mint))
+    notifier.send("\n".join(lines), notifier.fomo_btn(mint))
+    try:
+        import bus; bus.activity(f"Winners watch: {name or mint[:6]}", lines[1] if len(lines)>1 else "match", "watch", "info", mint)
+    except Exception:
+        pass
+    log.info(f"watch hit {name or mint} n={len(hits)}")
+
+def watch_coin(mint, creator=None, curve=None, name=None, s=None, src=""):
+    """Flag a new coin if a mapped top-10 address is the creator, early buyer, or their funder."""
+    s = s or config.load()
+    idx = linked_index()
+    if not idx: return
+    hits = []
+    if creator:
+        recs = match_addr(creator, idx)
+        if recs: hits.append((creator, "creator", recs))
+        else:
+            try:
+                f = _funder(creator)
+            except Exception:
+                f = None
+            recs = match_addr(f, idx)
+            if recs: hits.append((f, "funder of creator", recs))
+    if hits:
+        _watch_alert(name, mint, hits)
+    # always queue a delayed early-buyer pass (new coins are still young — shallow walk is enough)
+    with _pl:
+        _pending.append((time.time() + 25, mint, curve, creator, name))
+        if len(_pending) > 40: del _pending[:len(_pending) - 40]
+
+def _watch_new_pairs(s):
+    mints = []
+    try:
+        from agents import trend
+        mints += list(trend.gecko_new() or [])
+    except Exception as e:
+        log.info(f"new pairs {type(e).__name__}")
+    seen = set()
+    for m in mints:
+        if not m or m in seen: continue
+        seen.add(m)
+        if db.q("select 1 from winner_coins where mint=?", (m,), True): continue
+        watch_coin(m, s=s, src="new_pair")
+        if len(seen) >= 25: break
+
+async def ws_loop(stop):
+    """PumpPortal new-token + migration stream (used when the old scanner is not running)."""
+    import websockets
+    WS = "wss://pumpportal.fun/api/data"
+    back = 1
+    while not stop.is_set():
+        try:
+            async with websockets.connect(WS, ping_interval=30) as w:
+                await w.send(json.dumps({"method": "subscribeMigration"}))
+                await w.send(json.dumps({"method": "subscribeNewToken"}))
+                back = 1; log.info("ws connected")
+                while not stop.is_set():
+                    raw = await asyncio.wait_for(w.recv(), timeout=120)
+                    m = json.loads(raw)
+                    typ = m.get("txType")
+                    if typ == "create":
+                        asyncio.get_running_loop().run_in_executor(None, on_new_token, m)
+                    elif typ == "migrate":
+                        cr = m.get("traderPublicKey") or m.get("creator")
+                        asyncio.get_running_loop().run_in_executor(None, on_migration, m.get("mint"), cr)
+        except Exception as e:
+            log.info(f"ws reconnect in {back}s ({type(e).__name__}: {e})")
+            await asyncio.sleep(back); back = min(back * 2, 60)
+
 def on_new_token(m):
     mint = m.get("mint"); creator = m.get("traderPublicKey") or m.get("creator")
     if not mint: return
     s = config.load()
     if not s.get("win_enabled", True): return
-    info = known_dev(creator)
-    if info and (info.get("use_score") or 0) >= s["win_alert_min_score"] and (info.get("cwins") or info.get("wins") or 0) >= 2 and info.get("label") != "dumper":
-        _alert("Winners", m.get("name"), mint, info["use_score"], info.get("cwins") or info.get("wins") or 0,
-               f"known dev {creator[:4]}…{creator[-4:]} · past wins {info.get('cwins') or info.get('wins')} · label {info.get('label') or 'watch'}")
-        _feed(mint, "winners", m.get("name"))
-    with _pl:
-        _pending.append((time.time() + 25, mint, m.get("bondingCurveKey"), creator, m.get("name")))
-        if len(_pending) > 40: del _pending[:len(_pending) - 40]
+    watch_coin(mint, creator=creator, curve=m.get("bondingCurveKey"), name=m.get("name"), s=s, src="create")
 
 def on_migration(mint, creator):
     s = config.load()
-    if not s.get("win_enabled", True): return
-    info = known_dev(creator)
-    if info and (info.get("use_score") or 0) >= s["win_min_cluster_score"] and info.get("label") != "dumper":
-        _alert("Winners", None, mint, info["use_score"], info.get("cwins") or info.get("wins") or 0,
-               f"migrated · known dev {creator[:4]}…{creator[-4:] if creator else ''}")
-        _feed(mint, "winners")
+    if not s.get("win_enabled", True) or not mint: return
+    watch_coin(mint, creator=creator, name=None, s=s, src="migrate")
 
 def _drain_pending(s):
     now = time.time(); due = []
@@ -500,66 +704,76 @@ def _drain_pending(s):
     for _, mint, curve, creator, name in due[:5]:
         db.beat("winners")
         try:
-            buyers = _first_buyers(curve, time.time() - 60, s) if curve else []
+            buyers, _st = _first_buyers(curve, time.time() - 60, s) if curve else ([], {})
         except Exception as e:
             log.info(f"early {mint} {type(e).__name__}"); continue
-        hits = known_good_cluster([b["addr"] for b in buyers], s)
+        idx = linked_index()
+        hits = []
+        for b in buyers:
+            recs = match_addr(b["addr"], idx)
+            if recs: hits.append((b["addr"], "early buyer", recs))
+            else:
+                try: f = _funder(b["addr"])
+                except Exception: f = None
+                recs = match_addr(f, idx)
+                if recs: hits.append((f, "funder of early buyer", recs))
         if hits:
-            h = max(hits, key=lambda x: x.get("use_score") or 0)
-            _alert("Winners", name, mint, h["use_score"], h.get("cwins") or h.get("wins") or 0,
-                   f"early buyer from cluster #{h.get('cid') or h.get('cluster_id')} · score {h['use_score']:.0f}")
-            _feed(mint, "winners", name)
-        # persist early roles even if not a known cluster (builds the map)
+            _watch_alert(name, mint, hits)
         for b in buyers:
             db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
                  (mint, b["addr"], "sniper", b["ts"]))
 
 def text():
-    cs = db.q("select * from winner_clusters where coalesce(label,'')!='cex' order by score desc, wins desc limit 10")
-    n = db.q("select count(*) n from winner_coins", one=True)["n"]
-    a = db.q("select count(*) n from winner_coins where analyzed=1", one=True)["n"]
-    lines = [f"Winners · {n} exploded coins · {a} analyzed · clusters {len(cs)}"]
-    if not cs: lines.append("No clusters yet (needs a few analyzed winners + shared funders).")
-    for c in cs:
-        f = c["funder"] or "?"
-        lines.append(f"#{c['id']} {c['label'] or 'watch'} · score {c['score'] or 0:.0f} · {c['wins'] or 0} wins · {c['rugs'] or 0} rugs · {c['wallets_n'] or 0} wallets · funder {f[:4]}…{f[-4:] if len(f)>8 else f}")
-    recent = db.q("select name,mint,max_mult,ath_mc,rug from winner_coins order by found_at desc limit 5")
-    if recent:
-        lines.append("Recent:")
-        for r in recent:
-            lines.append(f"  {(r['name'] or r['mint'][:6])} · {r['max_mult'] or 0:.0f}x · MC ${r['ath_mc'] or 0:,.0f}" + (" · rug" if r["rug"] else ""))
+    top = db.q("select * from winner_coins where coalesce(rank,0)>0 and coalesce(rug,0)=0 order by rank")
+    uniq = db.q("select count(distinct addr) n from winner_roles", one=True)["n"]
+    lines = [f"Winners · top {len(top)} exploded (24h) · {uniq} linked wallets"]
+    if not top:
+        lines.append("No top-10 list yet — waiting for the first mapping cycle.")
+    for c in top:
+        counts = db.q("select role, count(*) n from winner_roles where mint=? group by role", (c["mint"],))
+        parts = ", ".join(f"{r['n']} {r['role']}" for r in counts) or "not mapped yet"
+        mapped = "mapped" if c["walk_done"] or c["analyzed"] else "mapping…"
+        lines.append(f"#{c['rank']} {c['name'] or c['mint'][:6]} · {c['max_mult'] or 0:.0f}x · MC ${c['ath_mc'] or 0:,.0f} · {mapped} · {parts}" + (" · rug" if c["rug"] else ""))
     return "\n".join(lines)
 
 def loop(stop):
-    # first cycle soon so we have findings after restart
     first = True
     while not stop.is_set():
         db.beat("winners")
         s = config.load()
         if not s.get("win_enabled", True) or not db.kv_get("desk_running", True):
             stop.wait(10); continue
+        t0 = time.time()
         try:
             _drain_pending(s)
             db.beat("winners")
             log.info("discovering exploded pump coins")
             cands = discover(s)
-            log.info(f"found {len(cands)} winner candidates")
-            fresh = []
-            for row in cands:
-                ex = db.q("select analyzed,ath_mc from winner_coins where mint=?", (row["mint"],), True)
-                _save_coin(row, s)
-                if not ex or not ex["analyzed"]: fresh.append(row)
-            budget = s["win_max_analyze"] if not first else min(s["win_max_analyze"], 2)
-            for row in fresh[:budget]:
+            for row in cands: _save_coin(row, s)
+            top = pick_top10(s, cands)
+            log.info(f"found {len(cands)} candidates, mapping top {len(top)}")
+            for row in top:
                 db.beat("winners")
+                if time.time() - t0 > 15 * 60:  # leave budget in the 20-min cycle for watching
+                    log.info("time box: remaining top-10 coins resume next cycle")
+                    break
+                coin = db.q("select * from winner_coins where mint=?", (row["mint"],), True)
+                if coin and coin["walk_done"] and coin["analyzed"] and not first:
+                    continue
                 try:
-                    log.info(f"analyzing {row.get('name') or row['mint']}")
+                    log.info(f"mapping #{row.get('rank')} {row.get('name') or row['mint']}")
+                    row = {**dict(coin or {}), **row, "deep": True, "walk_before": (coin["walk_before"] if coin else None)}
                     analyze(row, s)
-                except Exception as e: log.info(f"analyze {row['mint']} {type(e).__name__}: {config.redact(e)}")
-            log.info(f"cycle cands={len(cands)} new={len(fresh)} analyzed={min(len(fresh), budget)}")
+                except Exception as e:
+                    log.info(f"analyze {row['mint']} {type(e).__name__}: {config.redact(e)}")
+            try: _watch_new_pairs(s)
+            except Exception as e: log.info(f"watch pairs {type(e).__name__}")
+            _idx[0] = 0  # refresh linked-wallet cache
+            log.info(f"cycle top={len(top)} linked={len(linked_index())}")
         except util.Http429:
             log.info("cycle 429, backing off"); stop.wait(45)
         except Exception as e:
             log.info(f"cycle err {type(e).__name__}: {config.redact(e)}")
         first = False
-        stop.wait(s.get("win_poll_s", 180))
+        wait = max(30, s.get("win_poll_s", 1200) - (time.time() - t0))
+        stop.wait(wait)

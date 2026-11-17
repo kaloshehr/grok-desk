@@ -77,5 +77,91 @@ class GemsScoring(unittest.TestCase):
         self.assertLessEqual(sc, 45)
         self.assertTrue(any("dev 91%" in w for w in why))
 
+
+class SafetyRules(unittest.TestCase):
+    def test_pump_origin_and_graduation(self):
+        from agents.gems import is_pump_origin, is_true_graduation
+        pump = "GPHYkVzPBjqt3yDaB1SeLgi2mX21WzccPvGJa76cpump"
+        other = "HSXiByeLx2TUspPzL8GuF3XbTBiv2UKaALw4USdBn9Ce"
+        self.assertTrue(is_pump_origin(pump))
+        self.assertFalse(is_pump_origin(other))
+        self.assertTrue(is_pump_origin(other, launchpad={"name": "Pump.Fun", "platform": "pump_fun"}))
+        now = 1_000_000
+        p = {"dexId": "pumpswap", "pairCreatedAt": (now - 600) * 1000}
+        self.assertTrue(is_true_graduation(pump, p, now=now))
+        self.assertFalse(is_true_graduation(other, p, now=now))  # not pump origin
+        self.assertFalse(is_true_graduation(pump, {"dexId": "meteora", "pairCreatedAt": (now-60)*1000}, now=now))
+        self.assertFalse(is_true_graduation(pump, {"dexId": "pumpswap", "pairCreatedAt": (now-4000)*1000}, now=now))
+
+    def test_lp_safety(self):
+        from agents.gems import lp_safety
+        pump = "xxxxpump"
+        safe, why, _ = lp_safety(pump, {"dexId": "pumpswap", "pairAddress": "P"},
+                                 {"markets": [{"pubkey": "P", "marketType": "pump_fun_amm", "lp": {"lpLockedPct": 100}}]})
+        self.assertTrue(safe)
+        unsafe, why, locked = lp_safety("nope", {"dexId": "meteora", "labels": ["DYN2"], "pairAddress": "M"},
+                                        {"markets": [{"pubkey": "M", "marketType": "meteora_damm_v2", "lp": {"lpLockedPct": 0}}]})
+        self.assertFalse(unsafe)
+        self.assertIn("Meteora", why)
+        # unlocked pumpswap that is NOT a pump.fun mint
+        fake, why, _ = lp_safety("notpump", {"dexId": "pumpswap", "pairAddress": "X"},
+                                 {"markets": [{"pubkey": "X", "marketType": "pump_fun_amm", "lp": {"lpLockedPct": 0}}]})
+        self.assertFalse(fake)
+        # meteora but verifiably locked
+        locked_ok, _, pct = lp_safety("nope", {"dexId": "meteora", "labels": ["DYN2"], "pairAddress": "L"},
+                                      {"markets": [{"pubkey": "L", "marketType": "meteora_damm_v2", "lp": {"lpLockedPct": 100}}]})
+        self.assertTrue(locked_ok)
+        # still on the pump.fun curve is not "LP locked", even if rugcheck reports 100
+        curve, why, _ = lp_safety("xxxxpump", {"dexId": "pumpfun"},
+                                  {"markets": [{"lp": {"lpLockedPct": 100}}]})
+        self.assertIsNone(curve)
+        self.assertIn("curve", why.lower())
+
+    def test_score_caps_unlocked_and_rugs(self):
+        from agents.gems import gem_score, blocked
+        # Larp-like: looks hot but Meteora unlocked, not pump origin
+        sc, why = gem_score({
+            "mc": 14962, "min_mc": 5000, "max_mc": 150000,
+            "vol_acc": 12, "buy_share": 0.64, "chg_m5": 12, "chg_h1": 40,
+            "liq": 26909, "just_graduated": False, "mint_revoked": True, "freeze_revoked": True,
+            "top10": 3, "pump_origin": False, "lp_safe": False, "lp_why": "Meteora unlocked LP",
+        })
+        self.assertLessEqual(sc, 40)
+        self.assertTrue(any("Meteora" in w or "not pump" in w for w in why))
+        self.assertEqual(blocked({"pump_origin": False, "lp_safe": False, "mint_revoked": True}), "not pump.fun origin")
+        self.assertEqual(blocked({"pump_origin": True, "lp_safe": False, "mint_revoked": True}), "LP not safe")
+        self.assertIsNone(blocked({"pump_origin": True, "lp_safe": True, "mint_revoked": True, "dev_pct": 2}))
+        sc, why = gem_score({
+            "mc": 15000, "min_mc": 5000, "max_mc": 150000, "liq": 8000,
+            "pump_origin": True, "lp_safe": True, "lp_why": "PumpSwap canonical",
+            "just_graduated": True, "mint_revoked": True, "freeze_revoked": True, "rugged": True,
+        })
+        self.assertLessEqual(sc, 10)
+        self.assertTrue(any("rugged" in w for w in why))
+
+    def test_youtube_like_still_passes(self):
+        from agents.gems import gem_score, blocked
+        sc, why = gem_score({
+            "mc": 45000, "min_mc": 5000, "max_mc": 150000,
+            "chg_m5": 24, "chg_h1": 40, "liq": 15000, "vol_acc": 0.9, "buy_share": 0.54,
+            "just_graduated": True, "mint_revoked": True, "freeze_revoked": True,
+            "dev_pct": 2, "top10": 36, "pump_origin": True, "lp_safe": True, "lp_why": "PumpSwap canonical",
+        })
+        self.assertGreaterEqual(sc, 75)
+        self.assertIsNone(blocked({"pump_origin": True, "lp_safe": True, "mint_revoked": True, "dev_pct": 2}))
+
+
+
+class TopTen(unittest.TestCase):
+    def test_rank_key(self):
+        from agents.winners import rank_key
+        rows = [
+            {"name": "a", "max_mult": 10, "ath_mc": 2_000_000},
+            {"name": "b", "max_mult": 300, "ath_mc": 1_000_000},
+            {"name": "c", "max_mult": 300, "ath_mc": 1_700_000},
+        ]
+        ranked = sorted(rows, key=rank_key, reverse=True)
+        self.assertEqual([r["name"] for r in ranked], ["c", "b", "a"])
+
 if __name__ == "__main__":
     unittest.main()
