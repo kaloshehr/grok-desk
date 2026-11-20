@@ -50,7 +50,7 @@ def q(sql, args=(), one=False):
             for col in ("peak_liq real", "last_liq real", "alerted_at real", "alert_liq real", "alert_mc real", "rug int default 0", "rug_at real", "creator text", "dex text"):
                 try: _c.execute("alter table gem_scores add column " + col)
                 except Exception: pass
-            for col in ("rank int", "walk_before text", "walk_done int default 0", "mapped_at real"):
+            for col in ("rank int", "walk_before text", "walk_done int default 0", "mapped_at real", "million_at real", "bubble_done int default 0", "bubble_at real", "src text"):
                 try: _c.execute("alter table winner_coins add column " + col)
                 except Exception: pass
             _c.execute("create index if not exists i_wroles_addr on winner_roles(addr)")

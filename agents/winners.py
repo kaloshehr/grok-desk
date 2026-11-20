@@ -1,11 +1,14 @@
 """Wallet-cluster tracker (PAPER, read-only). Never places orders or touches funds.
 
-Every ~20 minutes take the top 10 exploded pump.fun-origin coins (by multiplier / ATH MC
-in ~24h) and fully map linked wallets: dev, snipers/early buyers, funders, and early
-holders who profited. RPC budget is spent mainly on those 10 (deeper, cached walks).
-New PumpPortal tokens are matched instantly against those creator/dev wallets (and their
-funders / same-cluster devs, kept for 7 days as the top-10 rotates). A Telegram alert
-is sent immediately with the link and how it matched. Alerts only — never buys.
+Source set: every Solana memecoin that crossed $1M MC (ATH) in the last 7 days
+(DexScreener, GeckoTerminal, plus coins we already stored). For each, build a
+Bubblemaps-style cluster: creator/dev, top holders, common funders and direct
+SOL/token links. Bubblemaps' public API requires a paid key (402), so clusters
+are computed from Helius RPC (cached, 429-aware, research budget). Watch those
+linked wallets on PumpPortal (subscribeAccountTrade + new-token creates). When
+one of them creates or buys a coin that is not a source coin / SOL / USDC, send
+an immediate Telegram alert. Alerts only — never buys. No min-liq / dump /
+exploded quality gates on these wallet alerts (dedupe per mint+wallet only).
 """
 import json, time, threading, collections, requests, asyncio, db, util, config, notifier, links
 log = util.logger("winners")
@@ -26,8 +29,151 @@ H = {"Accept": "application/json", "User-Agent": "desk/1.0"}
 _pending = []  # delayed early-buyer inspections
 _pl = threading.Lock()
 _alerted = {}
-_cidx = [0.0, {}]          # creator-watch index cache
+_cidx = [0.0, {}]          # $1M-wallet watch index cache
 _watch_rev = [0]           # bumped when the account-trade key set changes
+
+# Quote / blue-chip mints never used as $1M sources or alert targets
+QUOTE_MINTS = {
+    "So11111111111111111111111111111111111111112",  # WSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",  # PYUSD
+    "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA",  # USDS
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # jitoSOL
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",  # bSOL
+    "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v",  # JupSOL
+    "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  # WBTC (wormhole)
+    "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMijf",  # cbBTC
+    "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # WETH (wormhole)
+}
+QUOTE_SYMS = {"SOL", "WSOL", "USDC", "USDT", "PYUSD", "USDS", "WBTC", "WETH", "CBBTC", "MSOL", "JITOSOL", "BSOL", "JUPSOL"}
+
+# DEX / program / sys accounts to drop from bubble maps (not CEX hot wallets)
+PROGRAMS = SYSTEM | QUOTE_MINTS | {
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "Vote111111111111111111111111111111111111111",
+    "Stake11111111111111111111111111111111111111",
+    "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+    "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo",
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM
+    "5Q544fKrFoe6tsEbD7S8ExxBQAjjtFMAXpJezKcRjtua",  # Raydium authority
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+    "routeUGWgWzqBWFcrCfv8tritsqukccJPmQnvT1Vk3n",
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca whirlpool
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  # Orca v1
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  # Meteora pools
+    "cpamdpZCGKUy5JxQXB4dcpGUSFkN2mQsSTTzZ8sKYeq",  # Meteora DAMM
+    "PhoeNiXZ8ByJGLubaCcVVVWpjNGyBMmb5n1WHxYQBoN",
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap
+    "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",  # OpenBook
+    "opnb2LAfJYbRMAHpPKsRQxLwxETDRjP2lAg6fLVS8d",
+    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+    "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",  # pump fee
+    "Ce6TQqeHC9p8KetsN6JsjHK7UTVXHMhx2onmznY3faTv",  # Meteora? leave if unknown skip
+}
+
+def is_quote_mint(mint, symbol=None, name=None):
+    if not mint: return True
+    if mint in QUOTE_MINTS or mint in SYSTEM: return True
+    sym = (symbol or "").upper().strip()
+    if sym in QUOTE_SYMS: return True
+    n = (name or "").lower()
+    if n in ("wrapped sol", "wrapped solana", "usd coin", "tether usd"): return True
+    return False
+
+def is_ignored_addr(addr, extra=None):
+    """Drop CEX/DEX/pool/program addresses from the bubble / watch set."""
+    if not addr or addr in PROGRAMS or addr in SYSTEM: return True
+    extra = extra or ()
+    if addr in extra: return True
+    return False
+
+def rowd(row):
+    """sqlite3.Row or dict -> dict."""
+    if not row: return {}
+    if isinstance(row, dict): return row
+    try: return dict(row)
+    except Exception: return {}
+
+def link_type(role=None, via=None):
+    v = (via or role or "").lower().replace("_", " ")
+    if v in ("creator", "dev", "same creator"): return "creator"
+    if v in ("funder", "is funder", "funder created", "funded by"): return "funder"
+    if v in ("holder", "cluster", "cluster holder", "same cluster"): return "cluster holder"
+    return "cluster holder"
+
+def crossed_1m(row, s=None, now=None):
+    """True if this memecoin crossed $1M MC (ATH) within the last win_watch_days."""
+    s = s or {}
+    now = now if now is not None else time.time()
+    days = float(s.get("win_watch_days", 7))
+    cutoff = now - days * 86400
+    min_ath = float(s.get("win_min_ath_mc_usd", 1_000_000) or 1_000_000)
+    mint = row.get("mint")
+    if is_quote_mint(mint, row.get("symbol"), row.get("name")): return False
+    mc = float(row.get("mc") or 0)
+    ath = max(mc, float(row.get("ath_mc") or 0))
+    if ath < min_ath: return False
+    million_at = row.get("million_at") or 0
+    if million_at and million_at >= cutoff: return True
+    launched = row.get("launched") or row.get("launched_at") or 0
+    found = row.get("found_at") or 0
+    if launched and launched >= cutoff: return True
+    if not launched and found and found >= cutoff: return True
+    # Infer a recent cross from a windowed price change (prev MC was below $1M)
+    changes = dict(row.get("changes") or {})
+    if row.get("change") is not None and "h24" not in changes:
+        changes["h24"] = row.get("change")
+    windows = {"m5": 300, "h1": 3600, "h6": 6*3600, "h24": 86400, "h7d": 7*86400, "7d": 7*86400}
+    for key, span in windows.items():
+        if span > days * 86400 + 60: continue
+        pct = changes.get(key)
+        if pct is None: continue
+        try:
+            prev = mc / (1 + float(pct) / 100.0)
+        except Exception:
+            continue
+        if prev < min_ath <= mc:
+            return True
+    return False
+
+def cluster_from_links(addrs, funder_of=None, pairs=None):
+    """Union-find: same funder, funder-of, and direct transfer pairs. Pure, no I/O."""
+    funder_of = funder_of or {}
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        if not a or not b or a == b: return
+        ra, rb = find(a), find(b)
+        if ra != rb: parent[rb] = ra
+    for a in addrs:
+        if a: parent.setdefault(a, a)
+    by_f = collections.defaultdict(list)
+    for a in addrs:
+        f = funder_of.get(a)
+        if not f: continue
+        if f in parent or f in addrs:
+            union(a, f)
+        by_f[f].append(a)
+    for f, group in by_f.items():
+        for a in group[1:]:
+            union(group[0], a)
+    for a, b in (pairs or []):
+        union(a, b)
+    groups = collections.defaultdict(list)
+    for a in addrs:
+        if a: groups[find(a)].append(a)
+    return [g for g in groups.values() if g]
 
 def is_pump(mint, p=None, name=""):
     if (mint or "").endswith("pump"): return True
@@ -62,6 +208,7 @@ def _gt_pools():
              ("/networks/solana/trending_pools?page=2", 130),
              ("/networks/solana/trending_pools?page=3", 180),
              ("/networks/solana/pools?page=1&sort=h24_volume_usd_desc", 170),
+             ("/networks/solana/pools?page=1&sort=fdv_usd_desc", 170),
              ("/networks/solana/new_pools?page=1", 80)]
     for path, ttl in pages:
         db.beat("winners", every=1)
@@ -77,23 +224,44 @@ def _gt_pools():
             try: launched = time.mktime(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
             except Exception: launched = 0
             ch = a.get("price_change_percentage") or {}
-            change = None
-            for k in ("h24", "h6", "h1"):
+            changes, change = {}, None
+            for k in ("m5", "h1", "h6", "h24", "h7d", "7d"):
                 if ch.get(k) is not None:
-                    try: change = float(ch[k]); break
+                    try:
+                        changes[k] = float(ch[k])
+                        if change is None and k in ("h24", "h6", "h1"): change = changes[k]
                     except Exception: pass
             mc = 0.0
-            for k in ("fdv_usd", "market_cap_usd"):
+            for k in ("market_cap_usd", "fdv_usd"):
                 try:
                     if a.get(k): mc = float(a[k]); break
                 except Exception: pass
+            # GT pool "name" is often "TOKEN / SOL"; prefer base token name later if we have it
             out.append({"mint": mint, "name": a.get("name") or "", "pool": a.get("address"),
-                        "mc": mc, "change": change, "launched": launched, "dex": None, "src": "gt"})
+                        "mc": mc, "change": change, "changes": changes, "launched": launched, "dex": None, "src": "gt"})
     return out
+
+def _pair_row(p, src="dex"):
+    mint = util.get(p, "baseToken.address")
+    if not mint or p.get("chainId") not in (None, "solana"): return None
+    created = (p.get("pairCreatedAt") or 0) / 1000
+    try: mc, _src = util.pair_mc(p, mint)
+    except Exception: mc = float(p.get("marketCap") or p.get("fdv") or 0)
+    chg = p.get("priceChange") or {}
+    changes, change = {}, None
+    for k in ("m5", "h1", "h6", "h24"):
+        if chg.get(k) is not None:
+            try:
+                changes[k] = float(chg[k])
+                if change is None and k in ("h24", "h6", "h1"): change = changes[k]
+            except Exception: pass
+    return {"mint": mint, "name": util.get(p, "baseToken.name") or "", "symbol": util.get(p, "baseToken.symbol"),
+            "pool": p.get("pairAddress"), "mc": mc or 0, "change": change, "changes": changes,
+            "launched": created, "dex": p.get("dexId"), "pair": p, "src": src}
 
 def _dex_pairs():
     out = []
-    for q in ("pumpswap", "pump"):
+    for q in ("pumpswap", "pump", "pumpfun"):
         db.beat("winners", every=1)
         try:
             util.DEX_RL.wait()
@@ -101,21 +269,45 @@ def _dex_pairs():
             if r.status_code == 429: raise util.Http429()
             r.raise_for_status()
             for p in r.json().get("pairs") or []:
-                if p.get("chainId") != "solana": continue
-                mint = util.get(p, "baseToken.address")
-                if not mint: continue
-                created = (p.get("pairCreatedAt") or 0) / 1000
-                mc = float(p.get("marketCap") or p.get("fdv") or 0)
-                ch = util.get(p, "priceChange.h24")
-                if ch is None: ch = util.get(p, "priceChange.h6")
-                out.append({"mint": mint, "name": util.get(p, "baseToken.name") or "", "symbol": util.get(p, "baseToken.symbol"),
-                            "pool": p.get("pairAddress"), "mc": mc, "change": ch, "launched": created, "dex": p.get("dexId"),
-                            "pair": p, "src": "dex"})
+                row = _pair_row(p, "dex")
+                if row: out.append(row)
         except util.Http429: log.info("dex 429"); break
         except Exception as e: log.info(f"dex {type(e).__name__}")
     return out
 
+def _dex_featured():
+    """Token profiles + boosts (DexScreener), then a live tokens lookup for MC."""
+    mints, out = [], []
+    for url in ("https://api.dexscreener.com/token-profiles/latest/v1",
+                "https://api.dexscreener.com/token-boosts/top/v1",
+                "https://api.dexscreener.com/token-boosts/latest/v1"):
+        db.beat("winners", every=1)
+        try:
+            util.DEX_RL.wait()
+            r = requests.get(url, headers=H, timeout=15)
+            if r.status_code == 429: raise util.Http429()
+            if r.status_code != 200: continue
+            for it in r.json() or []:
+                if (it.get("chainId") or "").lower() != "solana": continue
+                m = it.get("tokenAddress")
+                if m and m not in mints: mints.append(m)
+        except util.Http429: log.info("dex featured 429"); break
+        except Exception as e: log.info(f"dex featured {type(e).__name__}")
+    if not mints: return out
+    try:
+        db.beat("winners", every=1)
+        pairs = util.dex_tokens(mints[:90], ttl=60, curve=True) or {}
+    except util.Http429:
+        log.info("dex featured tokens 429"); return out
+    except Exception as e:
+        log.info(f"dex featured tokens {type(e).__name__}"); return out
+    for m, p in pairs.items():
+        row = _pair_row(p, "dex_featured")
+        if row: out.append(row)
+    return out
+
 def discover(s):
+    """Legacy 24h / 10x-or-$500k pump scan (kept for top-10 display only)."""
     cands, seen = [], set()
     for row in _gt_pools() + _dex_pairs():
         mint = row["mint"]
@@ -127,6 +319,42 @@ def discover(s):
         ok, mult = is_winner(row.get("mc") or 0, row.get("change"), age_h, s)
         if not ok: continue
         row["mult"] = mult; row["age_h"] = age_h; cands.append(row)
+    return cands
+
+def discover_million(s):
+    """All Solana memecoins that crossed $1M ATH MC in the last 7 days."""
+    cands, seen = [], set()
+    rows = []
+    try: rows += _gt_pools()
+    except Exception as e: log.info(f"discover gt {type(e).__name__}")
+    try: rows += _dex_pairs()
+    except Exception as e: log.info(f"discover dex {type(e).__name__}")
+    try: rows += _dex_featured()
+    except Exception as e: log.info(f"discover featured {type(e).__name__}")
+    # already-known $1M (or near) coins, including rugs — ATH still counts
+    try:
+        for r in db.q("select * from winner_coins where coalesce(ath_mc,0) >= 500000"):
+            rows.append({
+                "mint": r["mint"], "name": r["name"], "symbol": r["symbol"], "pool": r["pool"],
+                "mc": r["ath_mc"] or 0, "ath_mc": r["ath_mc"], "launched": r["launched_at"] or 0,
+                "launched_at": r["launched_at"], "found_at": r["found_at"], "million_at": r["million_at"] if "million_at" in r.keys() else None,
+                "creator": r["creator"], "src": "db",
+            })
+    except Exception as e:
+        log.info(f"discover db {type(e).__name__}")
+    now = time.time()
+    for row in rows:
+        mint = row.get("mint")
+        if not mint or mint in seen: continue
+        seen.add(mint)
+        if not crossed_1m(row, s, now=now): continue
+        launched = row.get("launched") or row.get("launched_at") or 0
+        age_h = (now - launched) / 3600 if launched else None
+        launch = s.get("win_launch_mc_usd", 5500) or 5500
+        mc = row.get("mc") or row.get("ath_mc") or 0
+        row["mult"] = round((mc / launch), 2) if mc and launch else row.get("mult") or 0
+        row["age_h"] = age_h
+        cands.append(row)
     return cands
 
 def pump_info(mint):
@@ -270,11 +498,17 @@ def _funder(addr):
 
 def _save_coin(row, s, creator=None, rug=0):
     mint = row["mint"]
-    ex = db.q("select ath_mc,max_mult from winner_coins where mint=?", (mint,), True)
+    ex = db.q("select ath_mc,max_mult,million_at from winner_coins where mint=?", (mint,), True)
     ath = max(row.get("mc") or 0, (ex["ath_mc"] if ex else 0) or 0)
     mult = max(row.get("mult") or 0, (ex["max_mult"] if ex else 0) or 0)
-    db.q("insert into winner_coins(mint,name,symbol,pool,creator,found_at,launched_at,ath_mc,max_mult,first_mc,status,rug,analyzed,json) values(?,?,?,?,?,?,?,?,?,?,?,?,0,?) on conflict(mint) do update set name=excluded.name,symbol=excluded.symbol,pool=excluded.pool,creator=coalesce(excluded.creator,winner_coins.creator),ath_mc=max(winner_coins.ath_mc,excluded.ath_mc),max_mult=max(winner_coins.max_mult,excluded.max_mult),rug=max(winner_coins.rug,excluded.rug),json=excluded.json",
-         (mint, row.get("name"), row.get("symbol"), row.get("pool"), creator, time.time(), row.get("launched"), ath, mult, row.get("mc"), "winner", rug, json.dumps({"src": row.get("src"), "change": row.get("change")})))
+    min_ath = float((s or {}).get("win_min_ath_mc_usd", 1_000_000) or 1_000_000)
+    million_at = (ex["million_at"] if ex else None) or row.get("million_at")
+    if ath >= min_ath and not million_at:
+        # if it launched in-window, the cross is at latest "now"; keep first-observed
+        million_at = time.time()
+    src = row.get("src")
+    db.q("insert into winner_coins(mint,name,symbol,pool,creator,found_at,launched_at,ath_mc,max_mult,first_mc,status,rug,analyzed,json,million_at,src) values(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?) on conflict(mint) do update set name=excluded.name,symbol=excluded.symbol,pool=excluded.pool,creator=coalesce(excluded.creator,winner_coins.creator),ath_mc=max(winner_coins.ath_mc,excluded.ath_mc),max_mult=max(winner_coins.max_mult,excluded.max_mult),rug=max(winner_coins.rug,excluded.rug),json=excluded.json,million_at=coalesce(winner_coins.million_at,excluded.million_at),src=coalesce(excluded.src,winner_coins.src)",
+         (mint, row.get("name"), row.get("symbol"), row.get("pool"), creator, time.time(), row.get("launched") or row.get("launched_at"), ath, mult, row.get("mc"), "winner", rug, json.dumps({"src": src, "change": row.get("change")}), million_at, src))
 
 def _is_rug(pair, ath_mc):
     if not pair: return False
@@ -678,65 +912,257 @@ def record_funder(mint, addr, funder):
          (funder, "funder", time.time(), json.dumps({})))
     _cidx[0] = 0
 
+def _record_role(mint, addr, role, ts=None):
+    if not mint or is_ignored_addr(addr, (mint,)): return
+    ts = ts or time.time()
+    db.q("insert or ignore into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)",
+         (addr, role, ts, json.dumps({})))
+    db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
+         (mint, addr, role, ts))
+
+def top_holders(mint, extra_skip=None, ttl=3600):
+    """Top token-account owners for a mint via getTokenLargestAccounts. Cached. No I/O in tests if monkeypatched."""
+    if not mint: return []
+    k = f"holders:{mint}"
+    hit = db.kv_get(k)
+    if hit and time.time() - hit.get("t", 0) < ttl:
+        return [h for h in (hit.get("holders") or []) if not is_ignored_addr(h, extra_skip)]
+    db.beat("winners", every=1)
+    try:
+        res = util.research_rpc("getTokenLargestAccounts", [mint], ttl=ttl) or {}
+    except Exception as e:
+        log.info(f"holders {mint[:6]} {type(e).__name__}")
+        return []
+    accs = [a.get("address") for a in (res.get("value") or []) if a.get("address")]
+    if not accs: return []
+    db.beat("winners", every=1)
+    try:
+        info = util.research_rpc("getMultipleAccounts", [accs, {"encoding": "jsonParsed"}], ttl=ttl) or {}
+    except Exception as e:
+        log.info(f"holders parse {mint[:6]} {type(e).__name__}")
+        return []
+    owners, seen = [], set()
+    for acc in (info.get("value") or []):
+        if not acc: continue
+        parsed = (((acc.get("data") or {}).get("parsed") or {}).get("info") or {})
+        owner = parsed.get("owner")
+        if not owner or owner in seen or is_ignored_addr(owner, extra_skip): continue
+        seen.add(owner); owners.append(owner)
+    try: db.kv_set(k, {"t": time.time(), "holders": owners})
+    except Exception: pass
+    return owners
+
+def _counterparties(addr, mint, known, limit=6):
+    """Recent SOL/token transfer counterparties that sit in `known`. Budget-light, cached sigs."""
+    if not addr or not known: return []
+    out = []
+    try:
+        db.beat("winners", every=1)
+        sigs = util.research_rpc("getSignaturesForAddress", [addr, {"limit": limit}], ttl=3600) or []
+    except Exception:
+        return []
+    known = set(known) - {addr}
+    for x in sigs:
+        if x.get("err"): continue
+        try:
+            db.beat("winners", every=1)
+            tx = util.research_rpc("getTransaction", [x["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}], ttl=7 * 86400)
+        except Exception:
+            continue
+        if not tx: continue
+        keys = set(_keys(tx))
+        # token transfers of this mint
+        meta = tx.get("meta") or {}
+        for b in (meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []):
+            if b.get("mint") == mint and b.get("owner") in known:
+                out.append(b["owner"])
+        for k in keys:
+            if k in known:
+                out.append(k)
+        if len(set(out)) >= 8: break
+    return list({x for x in out if x and x != addr})
+
+def map_bubble(mint, s=None, deadline=None, coin=None):
+    """Build a Bubblemaps-style cluster for one $1M coin and store it. Helius RPC, cached."""
+    s = s or config.load()
+    coin = rowd(coin or db.q("select * from winner_coins where mint=?", (mint,), True) or {})
+    extra_skip = {mint}
+    if coin.get("pool"): extra_skip.add(coin["pool"])
+    info = {}
+    try: info = pump_info(mint) or {}
+    except Exception: pass
+    curve = info.get("bonding_curve") or info.get("bondingCurve")
+    if curve: extra_skip.add(curve)
+    creator = coin.get("creator") or info.get("creator") or info.get("creatorId")
+    if not creator and (deadline is None or time.time() < deadline - 5):
+        try: creator = resolve_creator(mint, deadline=deadline)
+        except Exception as e: log.info(f"bubble creator {mint[:6]} {type(e).__name__}")
+    if creator:
+        record_creator(mint, creator, coin.get("name"), coin.get("launched_at"))
+        extra_skip.add(mint)
+    holders = []
+    if deadline is None or time.time() < deadline:
+        try:
+            holders = top_holders(mint, extra_skip=extra_skip)
+        except Exception as e:
+            log.info(f"bubble holders {mint[:6]} {type(e).__name__}")
+            holders = []
+    for h in holders:
+        _record_role(mint, h, "holder", coin.get("launched_at"))
+    wallets = []
+    if creator and not is_ignored_addr(creator, extra_skip):
+        wallets.append(creator)
+    wallets += [h for h in holders if h != creator]
+    funder_of, pairs = {}, []
+    # funders (cached). Cap to keep the 30 rpc/min budget healthy.
+    for addr in wallets[:16]:
+        if deadline is not None and time.time() >= deadline: break
+        try:
+            f = _funder(addr)
+        except Exception:
+            f = None
+        if f and not is_ignored_addr(f, extra_skip):
+            funder_of[addr] = f
+            if addr == creator or addr == coin.get("creator"):
+                record_funder(mint, addr, f)
+            else:
+                _record_role(mint, f, "funder")
+                prev = db.q("select json from winner_wallets where addr=?", (addr,), True)
+                j = json.loads(prev["json"]) if prev and prev["json"] else {}
+                j["funder"] = f
+                if not prev:
+                    db.q("insert into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)",
+                         (addr, "holder", time.time(), json.dumps(j)))
+                else:
+                    db.q("update winner_wallets set json=? where addr=?", (json.dumps(j), addr))
+    # a few recent transfer links among the same set
+    known = set(wallets) | set(funder_of.values())
+    for addr in wallets[:8]:
+        if deadline is not None and time.time() >= deadline: break
+        try:
+            for other in _counterparties(addr, mint, known, limit=5):
+                if not is_ignored_addr(other, extra_skip):
+                    pairs.append((addr, other))
+        except Exception:
+            pass
+    groups = cluster_from_links(list(known), funder_of, pairs)
+    creator_group = None
+    if creator:
+        for g in groups:
+            if creator in g:
+                creator_group = g; break
+    if creator_group:
+        for addr in creator_group:
+            if addr == creator or is_ignored_addr(addr, extra_skip): continue
+            # already a funder or holder? still tag cluster
+            _record_role(mint, addr, "cluster")
+    else:
+        for g in groups:
+            if len(g) < 2: continue
+            for addr in g:
+                if is_ignored_addr(addr, extra_skip): continue
+                _record_role(mint, addr, "cluster")
+    done = bool(creator or holders)
+    try:
+        db.q("update winner_coins set bubble_done=?,bubble_at=?,creator=coalesce(?,creator) where mint=?",
+             (int(done), time.time(), creator, mint))
+    except Exception:
+        pass
+    _cidx[0] = 0
+    _watch_rev[0] += 1
+    n = len({a for a in (wallets + list(funder_of.values()) + [x for pr in pairs for x in pr]) if a})
+    log.info(f"bubble {coin.get('name') or mint[:6]} creator={(creator or '')[:6]} holders={len(holders)} links={len(pairs)} wallets~{n}")
+    return done
+
+def map_million_bubbles(s, budget_s=600):
+    """Incrementally map unmapped $1M coins. Respects RPC 429 / research budget."""
+    start = time.time()
+    deadline = start + budget_s
+    coins = [rowd(c) for c in watch_coins(s)]
+    # unmapped first, then stale (>12h)
+    def stale(c):
+        if not c.get("bubble_done"): return 0
+        at = c.get("bubble_at") or 0
+        return 1 if at and time.time() - at > 12 * 3600 else 2
+    coins = sorted(coins, key=lambda c: (stale(c), -(c.get("ath_mc") or 0)))
+    n = 0
+    for c in coins:
+        if time.time() >= deadline: break
+        if stale(c) == 2: break
+        db.beat("winners", every=1)
+        try:
+            if map_bubble(c["mint"], s, deadline=deadline, coin=c):
+                n += 1
+        except util.Http429:
+            log.info("bubble 429, pause mapping")
+            break
+        except Exception as e:
+            log.info(f"bubble {c['mint'][:6]} {type(e).__name__}: {config.redact(e)}")
+    return n
+
 def watch_coins(s=None):
-    """Current top-10 plus exploded winners from the last win_watch_days days (including rugged ones)."""
+    """Coins that crossed $1M ATH MC in the last win_watch_days days (rugs included)."""
     s = s or config.load()
     days = float(s.get("win_watch_days", 7))
     cut = time.time() - days * 86400
-    min_mult = s.get("win_min_mult", 10)
-    min_mc = s.get("win_min_mc_usd", 500000)
+    min_ath = float(s.get("win_min_ath_mc_usd", 1_000_000) or 1_000_000)
+    # backfill million_at so already-stored $1M coins enter the window
+    try:
+        db.q("""update winner_coins set million_at=coalesce(million_at, launched_at, found_at)
+                where coalesce(ath_mc,0) >= ? and million_at is null""", (min_ath,))
+    except Exception:
+        pass
     return db.q("""select * from winner_coins
-                   where coalesce(rank,0)>0
-                      or ((coalesce(max_mult,0) >= ? or coalesce(ath_mc,0) >= ?)
-                          and coalesce(launched_at, found_at, 0) >= ?)""",
-                (min_mult, min_mc, cut))
+                   where coalesce(ath_mc,0) >= ?
+                     and coalesce(million_at, launched_at, found_at, 0) >= ?""",
+                (min_ath, cut))
+
+def source_mints(s=None):
+    return {r["mint"] for r in watch_coins(s) if r["mint"]}
 
 def creator_watch_index():
-    """addr -> list of {mint,name,role,max_mult,rank,via} for winner creators/devs, their funders, and cluster devs."""
+    """addr -> list of {mint,name,role,via,ath_mc,...} for $1M-coin bubble wallets (creator, holder, funder, cluster)."""
     if time.time() - _cidx[0] < 15 and _cidx[1]: return _cidx[1]
-    coins = watch_coins()
+    coins = [rowd(c) for c in watch_coins()]
     out = collections.defaultdict(list)
-    mints, devs = set(), set()
-    def add(addr, coin, role, via):
-        if not addr or addr in SYSTEM: return
-        out[addr].append({"mint": coin["mint"], "name": coin["name"], "role": role, "via": via,
-                          "max_mult": coin["max_mult"], "rank": coin["rank"], "rug": coin["rug"]})
+    mints = set()
+    def add(addr, coin, role, via=None):
+        coin = rowd(coin)
+        if is_ignored_addr(addr, (coin.get("mint"), coin.get("pool"))): return
+        lt = link_type(role, via)
+        rec = {"mint": coin["mint"], "name": coin.get("name"), "role": lt, "via": lt,
+               "max_mult": coin.get("max_mult"), "ath_mc": coin.get("ath_mc"),
+               "rank": coin.get("rank"), "rug": coin.get("rug")}
+        # don't duplicate the same source mint+role
+        prev = out[addr]
+        if any(x["mint"] == rec["mint"] and x["role"] == rec["role"] for x in prev):
+            return
+        prev.append(rec)
     for c in coins:
         mints.add(c["mint"])
         if c["creator"]:
-            add(c["creator"], c, "dev", "creator")
-            devs.add(c["creator"])
+            add(c["creator"], c, "creator", "creator")
     if mints:
         ph = ",".join("?" * len(mints))
-        for r in db.q(f"""select r.addr, r.role, r.mint, c.name, c.max_mult, c.ath_mc, c.rank, c.rug, c.creator
+        for r in db.q(f"""select r.addr, r.role, r.mint, c.name, c.max_mult, c.ath_mc, c.rank, c.rug, c.pool
                           from winner_roles r join winner_coins c on c.mint=r.mint
-                          where r.mint in ({ph}) and r.role in ('dev','funder')""", tuple(mints)):
-            coin = {"mint": r["mint"], "name": r["name"], "max_mult": r["max_mult"], "rank": r["rank"], "rug": r["rug"]}
+                          where r.mint in ({ph})
+                            and r.role in ('dev','creator','funder','holder','cluster','cluster holder')""",
+                      tuple(mints)):
+            coin = {"mint": r["mint"], "name": r["name"], "max_mult": r["max_mult"], "ath_mc": r["ath_mc"],
+                    "rank": r["rank"], "rug": r["rug"], "pool": r["pool"]}
             add(r["addr"], coin, r["role"], r["role"])
-            if r["role"] == "dev": devs.add(r["addr"])
-        # funder recorded on the dev wallet json
-        if devs:
-            ph2 = ",".join("?" * len(devs))
-            for w in db.q(f"select addr, json, cluster_id from winner_wallets where addr in ({ph2})", tuple(devs)):
+        # funder recorded on the creator wallet json
+        creators = [c["creator"] for c in coins if c["creator"]]
+        if creators:
+            ph2 = ",".join("?" * len(creators))
+            for w in db.q(f"select addr, json from winner_wallets where addr in ({ph2})", tuple(creators)):
                 try: j = json.loads(w["json"] or "{}")
                 except Exception: j = {}
                 f = j.get("funder")
-                if f:
-                    # attach to the first coin this dev created in our set
-                    src = next((c for c in coins if c["creator"] == w["addr"] or any(
-                        x["mint"] == c["mint"] and x.get("role") == "dev" for x in out.get(w["addr"], []))), None)
-                    if src: add(f, src, "funder", "funder")
-    # other dev-role wallets in the same cluster as a watched dev
-    if devs:
-        ph = ",".join("?" * len(devs))
-        cids = [r["cluster_id"] for r in db.q(f"select distinct cluster_id from winner_wallets where addr in ({ph}) and cluster_id is not null", tuple(devs))]
-        cids = [c for c in cids if c]
-        if cids:
-            phc = ",".join("?" * len(cids))
-            for w in db.q(f"select addr, cluster_id, role from winner_wallets where cluster_id in ({phc}) and role='dev'", tuple(cids)):
-                if w["addr"] in out: continue
-                src = next((c for c in coins if c["creator"] and c["creator"] in devs), coins[0] if coins else None)
-                if src: add(w["addr"], src, "dev", "cluster")
+                if not f: continue
+                src = next((c for c in coins if c["creator"] == w["addr"]), None)
+                if src: add(f, src, "funder", "funder")
     _cidx[0], _cidx[1] = time.time(), out
     return out
 
@@ -744,60 +1170,51 @@ def creator_watch_keys():
     return [a for a in creator_watch_index() if a and a not in SYSTEM]
 
 def hits_for_creator(creator, idx, funder=None):
-    """Pure matcher: new-coin creator (and optional funder) against the watch index."""
+    """Pure matcher: new-coin creator (and optional funder) against the $1M wallet index.
+    Returns (addr, action, recs) with action in created / funded."""
     hits = []
     if creator:
         recs = idx.get(creator) or []
         if recs:
-            via = recs[0].get("via") or recs[0].get("role") or "dev"
-            if via in ("creator", "dev"): how = "same creator"
-            elif via == "cluster": how = "same cluster"
-            elif via == "funder": how = "is funder"
-            else: how = "same creator"
-            hits.append((creator, how, recs))
+            hits.append((creator, "created", recs))
             return hits
     if funder:
         recs = idx.get(funder) or []
         if recs:
-            hits.append((funder, "funded by", recs))
+            hits.append((funder, "funded", recs))
     return hits
+
+def _src_tag(src):
+    wname = (src or {}).get("name") or ((src or {}).get("mint") or "")[:6]
+    ath = (src or {}).get("ath_mc")
+    cap = f"ATH ${ath:,.0f}" if ath else (f"{(src or {}).get('max_mult') or 0:.0f}x" if (src or {}).get("max_mult") else "")
+    tag = wname + (f" ({cap})" if cap else "")
+    if (src or {}).get("rug"): tag += " · rug"
+    return tag
 
 def format_creator_alert(name, mint, hits, extra=None):
     """Build the Telegram body. No I/O. FOMO link only via links.coin_url (no referral params)."""
     extra = extra or {}
     title = name or (mint[:6] if mint else "?")
-    if extra.get("symbol"): title += f" ({extra['symbol']})"
-    lines = [f"PAPER · Winner creator: {title}"]
-    for addr, how, recs in (hits or [])[:6]:
+    if extra.get("symbol") and extra["symbol"] not in (title or ""):
+        title += f" ({extra['symbol']})"
+    lines = [f"PAPER · $1M wallet: {title}"]
+    for addr, how, recs in (hits or [])[:8]:
         src = (recs or [{}])[0]
-        wname = src.get("name") or (src.get("mint") or "")[:6]
-        mult = src.get("max_mult") or 0
-        rank = src.get("rank")
-        tag = (f"#{rank} " if rank else "") + wname + (f" ({mult:.0f}x)" if mult else "")
-        if src.get("rug"): tag += " · rug"
         short = f"{addr[:4]}…{addr[-4:]}" if addr and len(addr) > 8 else (addr or "?")
-        if how in ("same creator", "creator", "dev"):
-            lines.append(f"• same creator as {tag}")
-        elif how in ("is funder", "funder created"):
-            lines.append(f"• funder of {tag} created this ({short})")
-        elif how in ("funded by", "funder of creator", "funder"):
-            lines.append(f"• funded by {short}, funder of {tag}")
-        elif how in ("same cluster", "cluster"):
-            lines.append(f"• same dev cluster as {tag} ({short})")
-        elif how in ("dev buy", "buy"):
-            lines.append(f"• dev of {tag} bought this coin ({short})")
+        lt = link_type(src.get("role"), src.get("via"))
+        # action may be created/bought/funded, or a legacy how string
+        how_l = (how or "").lower()
+        if how_l in ("bought", "buy", "dev buy"):
+            act = "bought this"
+        elif how_l in ("funded", "funded by", "funder of creator"):
+            act = "funded this coin's creator"
         else:
-            lines.append(f"• {how} · {short} · {tag}")
+            act = "created this"
+        lines.append(f"• {short} · {lt} of {_src_tag(src)} {act}")
     if mint:
         lines.append(f"mint: {mint}")
     mc, mc_sol = extra.get("mc"), extra.get("mc_sol")
-    pump = extra.get("pump_origin")
-    if pump is None and mint:
-        pump = mint.endswith("pump")
-    dev = extra.get("dev_pct")
-    safety = ("pump.fun origin" if pump else "not pump.fun origin") if pump is not None else None
-    if safety is not None:
-        safety += f" · dev share {dev:.1f}%" if dev is not None else " · dev share n/a"
     cap = None
     if mc:
         label = "FDV" if extra.get("mc_src") == "fdv" else "MC"
@@ -812,30 +1229,32 @@ def format_creator_alert(name, mint, hits, extra=None):
     elif mc_sol:
         try: cap = f"bonding ~{float(mc_sol):.1f} SOL (not a Dex/FOMO MC)"
         except Exception: cap = None
-    if cap and safety: lines.append(f"{cap} · {safety}")
-    elif cap: lines.append(cap)
-    elif safety: lines.append(safety)
+    if cap: lines.append(cap)
     if mint:
         lines.append(links.coin_url(mint))
     return "\n".join(lines)
 
-def already_alerted(mint):
+def _alert_key(mint, wallet=None):
+    return f"watch:{mint}:{wallet or ''}"
+
+def already_alerted(mint, wallet=None):
+    """Dedupe per mint+wallet (7d). wallet=None is the legacy per-mint key."""
     if not mint: return True
-    key = f"watch:{mint}"
+    key = _alert_key(mint, wallet)
     if time.time() - _alerted.get(key, 0) < 7 * 86400:
         return True
     try:
-        if db.kv_get(f"win_watch_alert:{mint}"):
+        if db.kv_get(f"win_watch_alert:{mint}:{wallet or ''}") or (wallet is None and db.kv_get(f"win_watch_alert:{mint}")):
             _alerted[key] = time.time()
             return True
     except Exception:
         pass
     return False
 
-def mark_alerted(mint):
-    key = f"watch:{mint}"
+def mark_alerted(mint, wallet=None):
+    key = _alert_key(mint, wallet)
     _alerted[key] = time.time()
-    try: db.kv_set(f"win_watch_alert:{mint}", time.time())
+    try: db.kv_set(f"win_watch_alert:{mint}:{wallet or ''}", time.time())
     except Exception: pass
 
 def enrich_live_mc(mint, extra=None):
@@ -877,20 +1296,31 @@ def creator_alert_quality(hits, mint, extra, s=None):
     return False, extra
 
 def send_creator_alert(name, mint, hits, extra=None, s=None):
-    """Immediate Telegram alert, deduped per mint. Alerts only — never feeds the executor."""
-    if not mint or not hits or already_alerted(mint): return False
-    ok, extra = creator_alert_quality(hits, mint, extra, s or config.load())
-    if not ok:
-        log.info(f"creator alert skipped (quality) {name or mint[:6]}")
+    """Immediate Telegram alert for a $1M-linked wallet. No quality/liq/dump gates.
+    Dedupe per mint+wallet. Skip the $1M source coins themselves and SOL/USDC."""
+    if not mint or not hits: return False
+    if is_quote_mint(mint, (extra or {}).get("symbol"), name):
         return False
-    mark_alerted(mint)
-    text = format_creator_alert(name, mint, hits, extra)
-    notifier.send(text, notifier.fomo_btn(mint))
     try:
-        import bus; bus.activity(f"Winner creator: {name or mint[:6]}", hits[0][1] if hits else "match", "watch", "info", mint)
+        if mint in source_mints(s):
+            return False
     except Exception:
         pass
-    log.info(f"creator alert {name or mint} n={len(hits)}")
+    fresh = []
+    for addr, how, recs in hits:
+        if not addr or already_alerted(mint, addr): continue
+        fresh.append((addr, how, recs))
+    if not fresh: return False
+    extra = enrich_live_mc(mint, extra)
+    for addr, _, _ in fresh:
+        mark_alerted(mint, addr)
+    text = format_creator_alert(name, mint, fresh, extra)
+    notifier.send(text, notifier.fomo_btn(mint))
+    try:
+        import bus; bus.activity(f"$1M wallet: {name or mint[:6]}", fresh[0][1] if fresh else "match", "watch", "info", mint)
+    except Exception:
+        pass
+    log.info(f"$1M wallet alert {name or mint} n={len(fresh)}")
     return True
 
 def backfill_creators(s, t0=None, budget_s=90):
@@ -979,7 +1409,7 @@ def _watch_alert(name, mint, hits, extra=None):
     if not hits: return
     # creator/funder/cluster/buy matches use the richer immediate formatter
     kinds = {h[1] for h in hits}
-    if kinds & {"same creator", "creator", "dev", "funded by", "funder of creator", "funder", "same cluster", "cluster", "dev buy", "buy"}:
+    if kinds & {"same creator", "creator", "dev", "funded by", "funder of creator", "funder", "same cluster", "cluster", "dev buy", "buy", "created", "bought", "funded"}:
         send_creator_alert(name, mint, hits, extra)
         return
     if already_alerted(mint): return
@@ -1000,6 +1430,13 @@ def watch_coin(mint, creator=None, curve=None, name=None, s=None, src="", extra=
     s = s or config.load()
     extra = dict(extra or {})
     if name and not extra.get("name"): extra["name"] = name
+    if is_quote_mint(mint, extra.get("symbol"), name):
+        return
+    try:
+        if mint in source_mints(s):
+            return
+    except Exception:
+        pass
     cidx = creator_watch_index()
     hits = hits_for_creator(creator, cidx)
     if not hits and creator and cidx:
@@ -1010,12 +1447,7 @@ def watch_coin(mint, creator=None, curve=None, name=None, s=None, src="", extra=
             f = None
         hits = hits_for_creator(creator, cidx, funder=f)
     if hits:
-        sent = send_creator_alert(name, mint, hits, extra, s=s)
-        # funded-by on a brand-new curve: retry once after Dex has a pair
-        if not sent and not extra.get("rechecked") and not already_alerted(mint):
-            extra = dict(extra); extra["rechecked"] = True
-            with _pl:
-                _pending.append((time.time() + 120, mint, curve, creator, name, extra, "creator_recheck"))
+        send_creator_alert(name, mint, hits, extra, s=s)
     # delayed early-buyer pass still uses the broader linked index (snipers etc.)
     with _pl:
         _pending.append((time.time() + 25, mint, curve, creator, name, extra))
@@ -1119,7 +1551,7 @@ def on_migration(mint, creator):
     watch_coin(mint, creator=creator, name=None, s=s, src="migrate", extra={"pump_origin": (mint or "").endswith("pump")})
 
 def on_account_trade(m):
-    """Optional path: a watched creator/dev buys a coin they did not already explode."""
+    """A watched $1M-linked wallet (creator, cluster holder, or funder) buys a non-source coin."""
     typ = (m or {}).get("txType")
     if typ != "buy": return
     mint = m.get("mint")
@@ -1127,15 +1559,18 @@ def on_account_trade(m):
     if not mint or not trader: return
     s = config.load()
     if not s.get("win_enabled", True): return
+    if is_quote_mint(mint, m.get("symbol"), m.get("name")): return
     recs = creator_watch_index().get(trader) or []
-    # only "dev bought a new coin", not every funder trade
-    recs = [r for r in recs if (r.get("via") or r.get("role")) in ("creator", "dev", "cluster")]
     if not recs: return
-    if any(r.get("mint") == mint for r in recs): return  # trading their own known winner
+    if any(r.get("mint") == mint for r in recs): return  # trading a source $1M coin
+    try:
+        if mint in source_mints(s): return
+    except Exception:
+        pass
     name = m.get("name")
     extra = _portal_extra(m)
     extra["pump_origin"] = extra.get("pump_origin") if extra.get("pump_origin") is not None else (mint or "").endswith("pump")
-    send_creator_alert(name, mint, [(trader, "dev buy", recs)], extra)
+    send_creator_alert(name, mint, [(trader, "bought", recs)], extra, s=s)
 
 def _drain_pending(s):
     now = time.time(); due = []
@@ -1174,18 +1609,36 @@ def _drain_pending(s):
                  (mint, b["addr"], "sniper", b["ts"]))
 
 def text():
-    top = db.q("select * from winner_coins where coalesce(rank,0)>0 and coalesce(rug,0)=0 order by rank")
-    uniq = db.q("select count(distinct addr) n from winner_roles", one=True)["n"]
+    s = config.load() or {}
+    coins = [rowd(c) for c in watch_coins(s)]
+    coins = sorted(coins, key=lambda c: c.get("ath_mc") or 0, reverse=True)
     nwatch = len(creator_watch_index())
-    days = int((config.load() or {}).get("win_watch_days", 7))
-    lines = [f"Winners · top {len(top)} exploded (24h) · {uniq} linked wallets · watching {nwatch} creator wallets ({days}d)"]
-    if not top:
-        lines.append("No top-10 list yet — waiting for the first mapping cycle.")
-    for c in top:
-        counts = db.q("select role, count(*) n from winner_roles where mint=? group by role", (c["mint"],))
-        parts = ", ".join(f"{r['n']} {r['role']}" for r in counts) or "not mapped yet"
-        mapped = "mapped" if c["walk_done"] or c["analyzed"] else "mapping…"
-        lines.append(f"#{c['rank']} {c['name'] or c['mint'][:6]} · {c['max_mult'] or 0:.0f}x · MC ${c['ath_mc'] or 0:,.0f} · {mapped} · {parts}" + (" · rug" if c["rug"] else ""))
+    days = int(s.get("win_watch_days", 7))
+    lines = [f"Winners · {len(coins)} coins crossed $1M MC in {days}d · watching {nwatch} linked wallets"]
+    if not coins:
+        lines.append("No $1M coins in the window yet — waiting for the next discovery cycle.")
+    for c in coins[:12]:
+        counts = db.q("select role, count(*) n from winner_roles where mint=? and role in ('dev','creator','holder','funder','cluster') group by role", (c["mint"],))
+        parts = ", ".join(f"{r['n']} {r['role']}" for r in counts) or "bubble pending"
+        mapped = "mapped" if c["bubble_done"] else "mapping…"
+        lines.append(f"{c['name'] or c['mint'][:6]} · ATH ${c['ath_mc'] or 0:,.0f} · {mapped} · {parts}" + (" · rug" if c["rug"] else ""))
+    return "\n".join(lines)
+
+def status_message():
+    """One-shot Telegram status: $1M coin count, top names+mints, wallets watched."""
+    s = config.load() or {}
+    coins = sorted((rowd(c) for c in watch_coins(s)), key=lambda c: c.get("ath_mc") or 0, reverse=True)
+    nwatch = len(creator_watch_index())
+    days = int(s.get("win_watch_days", 7))
+    lines = [f"PAPER · $1M wallet watch on",
+             f"Watching {len(coins)} coins that crossed $1M MC in the last {days} days, {nwatch} linked wallets.",
+             "Bubble map: Helius RPC (Bubblemaps public API returned 402; no paid key). Research RPC budget 30/min."]
+    for c in coins[:8]:
+        mint = c["mint"]
+        short = mint if mint else "?"
+        lines.append(f"• {c['name'] or mint[:6]}  ATH ${c['ath_mc'] or 0:,.0f}  {short}")
+    if len(coins) > 8:
+        lines.append(f"• …and {len(coins)-8} more")
     return "\n".join(lines)
 
 def loop(stop):
@@ -1196,6 +1649,12 @@ def loop(stop):
         if not s.get("win_enabled", True) or not db.kv_get("desk_running", True):
             stop.wait(10); continue
         t0 = time.time()
+        pulse = threading.Event()
+        def _pulse():
+            while not pulse.is_set() and not stop.is_set():
+                db.beat("winners", every=1)
+                pulse.wait(8)
+        threading.Thread(target=_pulse, daemon=True).start()
         try:
             _drain_pending(s)
             db.beat("winners", every=1)
@@ -1204,39 +1663,36 @@ def loop(stop):
                 log.info(f"backfill creators +{nfill}, watching {len(creator_watch_index())}")
             except Exception as e:
                 log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
-            log.info("discovering exploded pump coins")
-            cands = discover(s)
+            log.info("discovering coins that crossed $1M MC in 7d")
+            cands = discover_million(s)
             for row in cands: _save_coin(row, s)
-            top = pick_top10(s, cands)
+            coins = watch_coins(s)
             try:
-                nfill = backfill_creators(s, budget_s=30)
-                if nfill: log.info(f"backfill new ranked +{nfill}, watching {len(creator_watch_index())}")
+                nfill = backfill_creators(s, budget_s=45)
+                if nfill: log.info(f"backfill $1M creators +{nfill}")
             except Exception as e:
                 log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
-            log.info(f"found {len(cands)} candidates, mapping top {len(top)}")
-            for row in top:
-                db.beat("winners")
-                if time.time() - t0 > 15 * 60:  # leave budget in the 20-min cycle for watching
-                    log.info("time box: remaining top-10 coins resume next cycle")
-                    break
-                coin = db.q("select * from winner_coins where mint=?", (row["mint"],), True)
-                if coin and coin["walk_done"] and coin["analyzed"] and not first:
-                    continue
-                try:
-                    log.info(f"mapping #{row.get('rank')} {row.get('name') or row['mint']}")
-                    row = {**dict(coin or {}), **row, "deep": True, "walk_before": (coin["walk_before"] if coin else None)}
-                    analyze(row, s)
-                except Exception as e:
-                    log.info(f"analyze {row['mint']} {type(e).__name__}: {config.redact(e)}")
+            left = max(30, 12 * 60 - (time.time() - t0))
+            try:
+                nm = map_million_bubbles(s, budget_s=left)
+                log.info(f"mapped bubbles +{nm}")
+            except Exception as e:
+                log.info(f"bubbles {type(e).__name__}: {config.redact(e)}")
+            # keep a 24h top-10 list for the dashboard only; alerts use the $1M set
+            try: pick_top10(s, cands)
+            except Exception as e: log.info(f"top10 {type(e).__name__}")
             try: _watch_new_pairs(s)
             except Exception as e: log.info(f"watch pairs {type(e).__name__}")
-            _idx[0] = 0  # refresh linked-wallet cache
+            _idx[0] = 0
             _cidx[0] = 0
-            log.info(f"cycle top={len(top)} linked={len(linked_index())} creators={len(creator_watch_index())}")
+            _watch_rev[0] += 1
+            log.info(f"cycle $1M={len(coins)} linked={len(creator_watch_index())} (from {len(cands)} discovered)")
         except util.Http429:
             log.info("cycle 429, backing off"); stop.wait(45)
         except Exception as e:
             log.info(f"cycle err {type(e).__name__}: {config.redact(e)}")
+        finally:
+            pulse.set()
         first = False
         wait = max(30, s.get("win_poll_s", 1200) - (time.time() - t0))
         stop.wait(wait)

@@ -201,54 +201,103 @@ class TopTen(unittest.TestCase):
 class CreatorWatch(unittest.TestCase):
     def test_hits_for_creator(self):
         from agents.winners import hits_for_creator
-        rec = {"mint": "Aaaapump", "name": "iAgent / SOL", "role": "dev", "via": "creator", "max_mult": 323, "rank": 1}
-        idx = {"CREATOR1": [rec], "FUNDER1": [{"mint": "Aaaapump", "name": "iAgent / SOL", "role": "funder", "via": "funder", "max_mult": 323, "rank": 1}]}
+        rec = {"mint": "Aaaapump", "name": "iAgent / SOL", "role": "creator", "via": "creator", "ath_mc": 1_777_721}
+        idx = {"CREATOR1": [rec], "FUNDER1": [{"mint": "Aaaapump", "name": "iAgent / SOL", "role": "funder", "via": "funder", "ath_mc": 1_777_721}]}
         h = hits_for_creator("CREATOR1", idx)
-        self.assertEqual(h[0][1], "same creator")
+        self.assertEqual(h[0][1], "created")
         self.assertEqual(h[0][0], "CREATOR1")
         h = hits_for_creator("NEWWALLET", idx, funder="FUNDER1")
-        self.assertEqual(h[0][1], "funded by")
+        self.assertEqual(h[0][1], "funded")
         self.assertEqual(h[0][0], "FUNDER1")
         h = hits_for_creator("FUNDER1", idx)
-        self.assertEqual(h[0][1], "is funder")
+        self.assertEqual(h[0][1], "created")
         self.assertFalse(hits_for_creator("nobody", idx))
 
     def test_format_creator_alert(self):
         from agents.winners import format_creator_alert
         import links
         mint = "HF2RBPrfNBk9TxggL2cYZFEKSgirzh5HKCngLENTpump"
-        recs = [{"mint": "44DZsPNJUtUyTkELAFYdwCpe82sEt12HZKrMgK1Spump", "name": "iAgent / SOL", "max_mult": 323.22, "rank": 1, "via": "creator", "role": "dev"}]
-        hits = [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "same creator", recs)]
-        body = format_creator_alert("Cool Dog", mint, hits, {"symbol": "LOOSY", "mc_sol": 28.5, "pump_origin": True})
-        self.assertIn("PAPER · Winner creator: Cool Dog (LOOSY)", body)
-        self.assertIn("same creator as #1 iAgent / SOL (323x)", body)
+        recs = [{"mint": "44DZsPNJUtUyTkELAFYdwCpe82sEt12HZKrMgK1Spump", "name": "iAgent / SOL", "ath_mc": 1_777_721, "via": "creator", "role": "creator"}]
+        hits = [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "created", recs)]
+        body = format_creator_alert("Cool Dog", mint, hits, {"symbol": "LOOSY", "mc": 12000})
+        self.assertIn("PAPER · $1M wallet: Cool Dog (LOOSY)", body)
+        self.assertIn("ZXez…se5p · creator of iAgent / SOL (ATH $1,777,721) created this", body)
         self.assertIn("mint: " + mint, body)
-        self.assertIn("pump.fun origin", body)
-        self.assertIn("dev share n/a", body)
+        self.assertIn("MC $12,000", body)
         self.assertIn(links.coin_url(mint), body)
         self.assertNotIn("ref=", body)
         self.assertNotIn("utm_", body)
         self.assertTrue(body.strip().endswith(links.coin_url(mint)))
-        funded = format_creator_alert("X", mint, [("FunderAddr11111111111111111111111111111", "funded by", recs)], {"pump_origin": True, "dev_pct": 4.2, "mc": 12000})
-        self.assertIn("funded by Fund…1111, funder of #1 iAgent / SOL (323x)", funded)
-        self.assertIn("MC $12,000", funded)
-        self.assertIn("dev share 4.2%", funded)
-        buy = format_creator_alert("Y", mint, [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "dev buy", recs)])
-        self.assertIn("dev of #1 iAgent / SOL (323x) bought this coin", buy)
+        funded = format_creator_alert("X", mint, [("FunderAddr11111111111111111111111111111", "funded", recs)], {"mc": 1900})
+        self.assertIn("Fund…1111 · creator of iAgent / SOL (ATH $1,777,721) funded this coin's creator", funded)
+        self.assertIn("MC $1,900", funded)
+        buy_recs = [{**recs[0], "role": "cluster holder", "via": "holder"}]
+        buy = format_creator_alert("Y", mint, [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "bought", buy_recs)])
+        self.assertIn("cluster holder of iAgent / SOL (ATH $1,777,721) bought this", buy)
 
     def test_already_alerted_memory(self):
         from agents import winners
+        from unittest.mock import patch
         winners._alerted.clear()
         mint = "DedupMint111111111111111111111111111111pump"
-        self.assertFalse(winners.already_alerted(mint))
-        winners._alerted["watch:" + mint] = __import__("time").time()
-        self.assertTrue(winners.already_alerted(mint))
+        wallet = "Wallet1111111111111111111111111111111111"
+        with patch.object(winners.db, "kv_get", return_value=None):
+            self.assertFalse(winners.already_alerted(mint, wallet))
+            winners._alerted[winners._alert_key(mint, wallet)] = __import__("time").time()
+            self.assertTrue(winners.already_alerted(mint, wallet))
+            self.assertFalse(winners.already_alerted(mint, "Wallet2222222222222222222222222222222222"))
         winners._alerted.clear()
 
     def test_watch_days_default(self):
         import config
         s = config.load()
         self.assertEqual(int(s.get("win_watch_days", 7)), 7)
+        self.assertEqual(int(s.get("win_min_ath_mc_usd", 0)), 1_000_000)
+
+    def test_crossed_1m_and_quotes(self):
+        from agents.winners import crossed_1m, is_quote_mint, is_ignored_addr, cluster_from_links
+        s = {"win_watch_days": 7, "win_min_ath_mc_usd": 1_000_000}
+        now = 1_700_000_000
+        self.assertTrue(crossed_1m({"mint": "Aaaapump", "mc": 2_000_000, "launched": now - 2 * 86400, "name": "FIONA"}, s, now=now))
+        self.assertFalse(crossed_1m({"mint": "Trollxxxx", "mc": 20_000_000, "launched": now - 579 * 86400, "change": 5}, s, now=now))
+        self.assertTrue(crossed_1m({"mint": "Newishxx", "mc": 1_500_000, "launched": now - 30 * 86400, "changes": {"h24": 200}}, s, now=now))
+        self.assertFalse(crossed_1m({"mint": "Smallpump", "mc": 200_000, "launched": now - 86400}, s, now=now))
+        self.assertTrue(is_quote_mint("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"))
+        self.assertTrue(is_quote_mint("So11111111111111111111111111111111111111112", symbol="SOL"))
+        self.assertTrue(is_ignored_addr("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"))
+        self.assertTrue(is_ignored_addr("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"))
+        groups = cluster_from_links(["A", "B", "C", "D"], {"A": "F", "B": "F"}, pairs=[("C", "D")])
+        sets = [set(g) for g in groups]
+        self.assertTrue(any({"A", "B"} <= g for g in sets))
+        self.assertTrue(any({"C", "D"} <= g for g in sets))
+
+    def test_send_wallet_alert_no_quality_gate(self):
+        from agents import winners
+        from unittest.mock import patch
+        mint = "NewDeadCurve" + __import__("uuid").uuid4().hex[:16] + "pump"
+        recs = [{"mint": "SrcMillion11111111111111111111111111pump", "name": "FIONA", "ath_mc": 3_300_317, "role": "funder", "via": "funder"}]
+        hits = [("FunderAddr11111111111111111111111111111", "funded", recs)]
+        sent = []
+        winners._alerted.clear()
+        def fake_send(text, buttons=None, chat=None, kind=None):
+            sent.append(text)
+        with patch.object(winners.notifier, "send", fake_send), \
+             patch.object(winners, "enrich_live_mc", lambda m, extra=None: dict(extra or {}, mc=1900, dex="pumpfun", liq=0)), \
+             patch.object(winners, "source_mints", lambda s=None: set()):
+            ok = winners.send_creator_alert("DeadCurve", mint, hits, {"mc": 1900, "liq": 0, "dex": "pumpfun"}, s={})
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("MC $1,900", sent[0])
+        self.assertIn("funder of FIONA", sent[0])
+        # source coin itself is never alerted
+        winners._alerted.clear()
+        src = recs[0]["mint"]
+        with patch.object(winners.notifier, "send", fake_send), \
+             patch.object(winners, "enrich_live_mc", lambda m, extra=None: dict(extra or {})), \
+             patch.object(winners, "source_mints", lambda s=None: {src}):
+            self.assertFalse(winners.send_creator_alert("FIONA", src, hits, s={}))
+        self.assertEqual(len(sent), 1)
+        winners._alerted.clear()
 
 
 if __name__ == "__main__":
