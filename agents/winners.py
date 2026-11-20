@@ -3,8 +3,9 @@
 Every ~20 minutes take the top 10 exploded pump.fun-origin coins (by multiplier / ATH MC
 in ~24h) and fully map linked wallets: dev, snipers/early buyers, funders, and early
 holders who profited. RPC budget is spent mainly on those 10 (deeper, cached walks).
-New PumpPortal tokens and new pairs are watched; if a mapped address appears as creator,
-early buyer, or funder, a Telegram alert names the address and the exploded coin it came from.
+New PumpPortal tokens are matched instantly against those creator/dev wallets (and their
+funders / same-cluster devs, kept for 7 days as the top-10 rotates). A Telegram alert
+is sent immediately with the link and how it matched. Alerts only — never buys.
 """
 import json, time, threading, collections, requests, asyncio, db, util, config, notifier, links
 log = util.logger("winners")
@@ -25,6 +26,8 @@ H = {"Accept": "application/json", "User-Agent": "desk/1.0"}
 _pending = []  # delayed early-buyer inspections
 _pl = threading.Lock()
 _alerted = {}
+_cidx = [0.0, {}]          # creator-watch index cache
+_watch_rev = [0]           # bumped when the account-trade key set changes
 
 def is_pump(mint, p=None, name=""):
     if (mint or "").endswith("pump"): return True
@@ -61,6 +64,7 @@ def _gt_pools():
              ("/networks/solana/pools?page=1&sort=h24_volume_usd_desc", 170),
              ("/networks/solana/new_pools?page=1", 80)]
     for path, ttl in pages:
+        db.beat("winners", every=1)
         try: data = gt.get(path, ttl).get("data") or []
         except util.Http429: log.info("gt 429"); break
         except Exception as e: log.info(f"gt {type(e).__name__}"); continue
@@ -90,6 +94,7 @@ def _gt_pools():
 def _dex_pairs():
     out = []
     for q in ("pumpswap", "pump"):
+        db.beat("winners", every=1)
         try:
             util.DEX_RL.wait()
             r = requests.get("https://api.dexscreener.com/latest/dex/search", params={"q": q}, headers=H, timeout=15)
@@ -303,17 +308,11 @@ def analyze(row, s):
     mint = row["mint"]
     t0 = time.time()
     info = pump_info(mint) or {}
-    creator = info.get("creator") or info.get("creatorId") or row.get("creator")
     curve = info.get("bonding_curve") or info.get("bondingCurve")
+    creator = info.get("creator") or info.get("creatorId") or row.get("creator")
     if not creator:
-        prev = db.q("select creator from winner_coins where mint=?", (mint,), True) or db.q("select creator from coins where mint=?", (mint,), True)
-        creator = prev["creator"] if prev else None
-    # rugcheck is shared and can block the desk; only try if we still have no creator and time left
-    if not creator and time.time() - t0 < 8:
-        try:
-            creator = (util.rugcheck(mint) or {}).get("creator")
-        except Exception:
-            pass
+        try: creator = resolve_creator(mint)
+        except Exception as e: log.info(f"resolve_creator {type(e).__name__}")
     buyers, rug = [], 0
     try:
         if not row.get("launched") and info.get("created_timestamp"):
@@ -348,7 +347,7 @@ def analyze(row, s):
         for role, addr, ts in addrs:
             if addr in SYSTEM: continue
             f = None
-            if role != "dev" and time.time() - t0 < 40:
+            if time.time() - t0 < 50:
                 try: f = _funder(addr)
                 except Exception as e: log.info(f"funder {type(e).__name__}")
             prev = db.q("select json from winner_wallets where addr=?", (addr,), True)
@@ -576,6 +575,327 @@ def pick_top10(s, cands):
         row["rank"] = i
     return ranked
 
+
+def resolve_creator(mint, deadline=None):
+    """Best-effort creator for a mint. DB, then mint-sig RPC (usually 1 page), then DAS/rugcheck."""
+    if not mint: return None
+    def leftover():
+        return deadline is None or time.time() < deadline
+    for sql in ("select creator from winner_coins where mint=?", "select creator from coins where mint=?"):
+        row = db.q(sql, (mint,), True)
+        if row and row["creator"] and row["creator"] not in SYSTEM:
+            return row["creator"]
+    # Mint account usually has only a handful of txs — cheaper and more reliable than rugcheck here.
+    if leftover():
+        try:
+            db.beat("winners", every=1)
+            cr = _creator_from_mint_sigs(mint, deadline=deadline)
+            if cr: return cr
+        except Exception as e:
+            log.info(f"mint sigs {mint[:6]} {type(e).__name__}")
+    # rugcheck only if mint-sig missed and we still have several seconds
+    if leftover() and (deadline is None or deadline - time.time() >= 10):
+        try:
+            db.beat("winners", every=1)
+            cr = (util.rugcheck(mint, ttl=6*3600) or {}).get("creator")
+            if cr and cr not in SYSTEM: return cr
+        except Exception:
+            pass
+    return None
+
+def _creator_from_asset(mint):
+    try:
+        asset = util.research_rpc("getAsset", {"id": mint}, ttl=6*3600)
+    except Exception:
+        try:
+            asset = util.research_rpc("getAsset", [mint], ttl=6*3600)
+        except Exception:
+            return None
+    if not asset: return None
+    for c in asset.get("creators") or []:
+        addr = c.get("address") if isinstance(c, dict) else None
+        if addr and addr not in SYSTEM: return addr
+    for a in asset.get("authorities") or []:
+        addr = a.get("address") if isinstance(a, dict) else None
+        if addr and addr not in SYSTEM: return addr
+    own = (asset.get("ownership") or {}).get("owner")
+    if own and own not in SYSTEM: return own
+    return None
+
+def _creator_from_mint_sigs(mint, deadline=None):
+    """The mint account itself usually has only a handful of txs (create + metadata). Fee payer of the oldest is the creator."""
+    to = 8
+    if deadline is not None:
+        to = max(3, min(8, int(deadline - time.time()) - 1))
+        if to < 3: return None
+    try:
+        db.beat("winners", every=1)
+        sigs = util.research_rpc("getSignaturesForAddress", [mint, {"limit": 20}], ttl=6*3600, timeout=to) or []
+    except Exception:
+        return None
+    if not sigs: return None
+    if len(sigs) == 20 and (deadline is None or deadline - time.time() >= 4):
+        try:
+            db.beat("winners", every=1)
+            more = util.research_rpc("getSignaturesForAddress", [mint, {"limit": 20, "before": sigs[-1]["signature"]}], ttl=6*3600, timeout=to) or []
+            if more: sigs = sigs + more
+        except Exception:
+            pass
+    oldest = sigs[-1]
+    try:
+        db.beat("winners", every=1)
+        tx = util.research_rpc("getTransaction", [oldest["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}], ttl=7*86400, timeout=to)
+    except Exception:
+        return None
+    if not tx: return None
+    for k in _keys(tx):
+        if k and k not in SYSTEM:
+            return k
+    return None
+
+def record_creator(mint, creator, name=None, launched=None):
+    """Persist creator on the coin and as a dev role so the watch set sees it."""
+    if not mint or not creator or creator in SYSTEM: return
+    db.q("update winner_coins set creator=coalesce(creator,?) where mint=?", (creator, mint))
+    db.q("insert or ignore into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)",
+         (creator, "dev", time.time(), json.dumps({})))
+    db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
+         (mint, creator, "dev", launched or time.time()))
+    _cidx[0] = 0
+
+def record_funder(mint, addr, funder):
+    if not mint or not funder or funder in SYSTEM or funder == addr: return
+    prev = db.q("select json from winner_wallets where addr=?", (addr,), True)
+    j = json.loads(prev["json"]) if prev and prev["json"] else {}
+    j["funder"] = funder
+    if not prev:
+        db.q("insert into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)", (addr, "dev", time.time(), json.dumps(j)))
+    else:
+        db.q("update winner_wallets set json=? where addr=?", (json.dumps(j), addr))
+    db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
+         (mint, funder, "funder", time.time()))
+    db.q("insert or ignore into winner_wallets(addr,role,first_seen,json) values(?,?,?,?)",
+         (funder, "funder", time.time(), json.dumps({})))
+    _cidx[0] = 0
+
+def watch_coins(s=None):
+    """Current top-10 plus exploded winners from the last win_watch_days days (including rugged ones)."""
+    s = s or config.load()
+    days = float(s.get("win_watch_days", 7))
+    cut = time.time() - days * 86400
+    min_mult = s.get("win_min_mult", 10)
+    min_mc = s.get("win_min_mc_usd", 500000)
+    return db.q("""select * from winner_coins
+                   where coalesce(rank,0)>0
+                      or ((coalesce(max_mult,0) >= ? or coalesce(ath_mc,0) >= ?)
+                          and coalesce(launched_at, found_at, 0) >= ?)""",
+                (min_mult, min_mc, cut))
+
+def creator_watch_index():
+    """addr -> list of {mint,name,role,max_mult,rank,via} for winner creators/devs, their funders, and cluster devs."""
+    if time.time() - _cidx[0] < 15 and _cidx[1]: return _cidx[1]
+    coins = watch_coins()
+    out = collections.defaultdict(list)
+    mints, devs = set(), set()
+    def add(addr, coin, role, via):
+        if not addr or addr in SYSTEM: return
+        out[addr].append({"mint": coin["mint"], "name": coin["name"], "role": role, "via": via,
+                          "max_mult": coin["max_mult"], "rank": coin["rank"], "rug": coin["rug"]})
+    for c in coins:
+        mints.add(c["mint"])
+        if c["creator"]:
+            add(c["creator"], c, "dev", "creator")
+            devs.add(c["creator"])
+    if mints:
+        ph = ",".join("?" * len(mints))
+        for r in db.q(f"""select r.addr, r.role, r.mint, c.name, c.max_mult, c.ath_mc, c.rank, c.rug, c.creator
+                          from winner_roles r join winner_coins c on c.mint=r.mint
+                          where r.mint in ({ph}) and r.role in ('dev','funder')""", tuple(mints)):
+            coin = {"mint": r["mint"], "name": r["name"], "max_mult": r["max_mult"], "rank": r["rank"], "rug": r["rug"]}
+            add(r["addr"], coin, r["role"], r["role"])
+            if r["role"] == "dev": devs.add(r["addr"])
+        # funder recorded on the dev wallet json
+        if devs:
+            ph2 = ",".join("?" * len(devs))
+            for w in db.q(f"select addr, json, cluster_id from winner_wallets where addr in ({ph2})", tuple(devs)):
+                try: j = json.loads(w["json"] or "{}")
+                except Exception: j = {}
+                f = j.get("funder")
+                if f:
+                    # attach to the first coin this dev created in our set
+                    src = next((c for c in coins if c["creator"] == w["addr"] or any(
+                        x["mint"] == c["mint"] and x.get("role") == "dev" for x in out.get(w["addr"], []))), None)
+                    if src: add(f, src, "funder", "funder")
+    # other dev-role wallets in the same cluster as a watched dev
+    if devs:
+        ph = ",".join("?" * len(devs))
+        cids = [r["cluster_id"] for r in db.q(f"select distinct cluster_id from winner_wallets where addr in ({ph}) and cluster_id is not null", tuple(devs))]
+        cids = [c for c in cids if c]
+        if cids:
+            phc = ",".join("?" * len(cids))
+            for w in db.q(f"select addr, cluster_id, role from winner_wallets where cluster_id in ({phc}) and role='dev'", tuple(cids)):
+                if w["addr"] in out: continue
+                src = next((c for c in coins if c["creator"] and c["creator"] in devs), coins[0] if coins else None)
+                if src: add(w["addr"], src, "dev", "cluster")
+    _cidx[0], _cidx[1] = time.time(), out
+    return out
+
+def creator_watch_keys():
+    return [a for a in creator_watch_index() if a and a not in SYSTEM]
+
+def hits_for_creator(creator, idx, funder=None):
+    """Pure matcher: new-coin creator (and optional funder) against the watch index."""
+    hits = []
+    if creator:
+        recs = idx.get(creator) or []
+        if recs:
+            via = recs[0].get("via") or recs[0].get("role") or "dev"
+            if via in ("creator", "dev"): how = "same creator"
+            elif via == "cluster": how = "same cluster"
+            elif via == "funder": how = "is funder"
+            else: how = "same creator"
+            hits.append((creator, how, recs))
+            return hits
+    if funder:
+        recs = idx.get(funder) or []
+        if recs:
+            hits.append((funder, "funded by", recs))
+    return hits
+
+def format_creator_alert(name, mint, hits, extra=None):
+    """Build the Telegram body. No I/O. FOMO link only via links.coin_url (no referral params)."""
+    extra = extra or {}
+    title = name or (mint[:6] if mint else "?")
+    if extra.get("symbol"): title += f" ({extra['symbol']})"
+    lines = [f"PAPER · Winner creator: {title}"]
+    for addr, how, recs in (hits or [])[:6]:
+        src = (recs or [{}])[0]
+        wname = src.get("name") or (src.get("mint") or "")[:6]
+        mult = src.get("max_mult") or 0
+        rank = src.get("rank")
+        tag = (f"#{rank} " if rank else "") + wname + (f" ({mult:.0f}x)" if mult else "")
+        if src.get("rug"): tag += " · rug"
+        short = f"{addr[:4]}…{addr[-4:]}" if addr and len(addr) > 8 else (addr or "?")
+        if how in ("same creator", "creator", "dev"):
+            lines.append(f"• same creator as {tag}")
+        elif how in ("is funder", "funder created"):
+            lines.append(f"• funder of {tag} created this ({short})")
+        elif how in ("funded by", "funder of creator", "funder"):
+            lines.append(f"• funded by {short}, funder of {tag}")
+        elif how in ("same cluster", "cluster"):
+            lines.append(f"• same dev cluster as {tag} ({short})")
+        elif how in ("dev buy", "buy"):
+            lines.append(f"• dev of {tag} bought this coin ({short})")
+        else:
+            lines.append(f"• {how} · {short} · {tag}")
+    if mint:
+        lines.append(f"mint: {mint}")
+    mc, mc_sol = extra.get("mc"), extra.get("mc_sol")
+    pump = extra.get("pump_origin")
+    if pump is None and mint:
+        pump = mint.endswith("pump")
+    dev = extra.get("dev_pct")
+    safety = ("pump.fun origin" if pump else "not pump.fun origin") if pump is not None else None
+    if safety is not None:
+        safety += f" · dev share {dev:.1f}%" if dev is not None else " · dev share n/a"
+    cap = None
+    if mc:
+        cap = f"MC ${mc:,.0f}"
+    elif mc_sol:
+        try: cap = f"MC ~{float(mc_sol):.2f} SOL"
+        except Exception: cap = None
+    if cap and safety: lines.append(f"{cap} · {safety}")
+    elif cap: lines.append(cap)
+    elif safety: lines.append(safety)
+    if mint:
+        lines.append(links.coin_url(mint))
+    return "\n".join(lines)
+
+def already_alerted(mint):
+    if not mint: return True
+    key = f"watch:{mint}"
+    if time.time() - _alerted.get(key, 0) < 7 * 86400:
+        return True
+    try:
+        if db.kv_get(f"win_watch_alert:{mint}"):
+            _alerted[key] = time.time()
+            return True
+    except Exception:
+        pass
+    return False
+
+def mark_alerted(mint):
+    key = f"watch:{mint}"
+    _alerted[key] = time.time()
+    try: db.kv_set(f"win_watch_alert:{mint}", time.time())
+    except Exception: pass
+
+def send_creator_alert(name, mint, hits, extra=None):
+    """Immediate Telegram alert, deduped per mint. Alerts only — never feeds the executor."""
+    if not mint or not hits or already_alerted(mint): return False
+    mark_alerted(mint)
+    text = format_creator_alert(name, mint, hits, extra)
+    notifier.send(text, notifier.fomo_btn(mint))
+    try:
+        import bus; bus.activity(f"Winner creator: {name or mint[:6]}", hits[0][1] if hits else "match", "watch", "info", mint)
+    except Exception:
+        pass
+    log.info(f"creator alert {name or mint} n={len(hits)}")
+    return True
+
+def backfill_creators(s, t0=None, budget_s=90):
+    """Fill missing creators on top-10 + last-7d winners. Returns how many new creators were stored."""
+    start = time.time()
+    deadline = start + budget_s
+    coins = watch_coins(s)
+    # already-known creators still need a dev role so the index sees them
+    n = 0
+    missing = []
+    for c in coins:
+        db.beat("winners", every=1)
+        if c["creator"]:
+            record_creator(c["mint"], c["creator"], c["name"], c["launched_at"])
+        else:
+            missing.append(c)
+    # ranked first, then higher multiplier
+    missing.sort(key=lambda c: (0 if c["rank"] else 1, -(c["max_mult"] or 0)))
+    for c in missing:
+        if time.time() >= deadline:
+            log.info(f"backfill time box, {len(missing) - n} creators left for next cycle")
+            break
+        db.beat("winners", every=1)
+        try:
+            cr = resolve_creator(c["mint"], deadline=deadline)
+        except Exception as e:
+            log.info(f"backfill {c['mint'][:6]} {type(e).__name__}")
+            continue
+        if not cr: continue
+        record_creator(c["mint"], cr, c["name"], c["launched_at"])
+        n += 1
+        log.info(f"backfill creator {(c['name'] or c['mint'][:6])} = {cr[:6]}…")
+        try:
+            f = _funder(cr)
+            if f: record_funder(c["mint"], cr, f)
+        except Exception:
+            pass
+    # funder walk for known creators that don't have one yet (cheap, cached)
+    for c in coins:
+        if time.time() >= deadline: break
+        cr = c["creator"] or (db.q("select creator from winner_coins where mint=?", (c["mint"],), True) or {}).get("creator")
+        if not cr: continue
+        prev = db.q("select json from winner_wallets where addr=?", (cr,), True)
+        j = json.loads(prev["json"]) if prev and prev["json"] else {}
+        if "funder" in j: continue
+        db.beat("winners", every=1)
+        try:
+            f = _funder(cr)
+            if f: record_funder(c["mint"], cr, f)
+        except Exception:
+            pass
+    _cidx[0] = 0
+    _watch_rev[0] += 1
+    return n
+
 _idx = [0.0, {}]
 def linked_index():
     """addr -> list of {mint,name,role,max_mult,rank} from mapped top-10 / analyzed winners."""
@@ -604,11 +924,16 @@ def match_addr(addr, idx=None):
     if not addr: return []
     return (idx or linked_index()).get(addr) or []
 
-def _watch_alert(name, mint, hits):
-    """hits: list of (addr, role_on_new_coin, recs). One alert per mint per 6h."""
-    key = f"watch:{mint}"
-    if time.time() - _alerted.get(key, 0) < 6 * 3600: return
-    _alerted[key] = time.time()
+def _watch_alert(name, mint, hits, extra=None):
+    """hits: list of (addr, role_on_new_coin, recs). Dedupe per mint. Alerts only."""
+    if not hits: return
+    # creator/funder/cluster/buy matches use the richer immediate formatter
+    kinds = {h[1] for h in hits}
+    if kinds & {"same creator", "creator", "dev", "funded by", "funder of creator", "funder", "same cluster", "cluster", "dev buy", "buy"}:
+        send_creator_alert(name, mint, hits, extra)
+        return
+    if already_alerted(mint): return
+    mark_alerted(mint)
     lines = [f"PAPER · Winners watch: {name or mint[:6]}"]
     for addr, role, recs in hits[:8]:
         lines.append("• " + (role + " · " if role else "") + _fmt_hit(addr, recs))
@@ -620,27 +945,25 @@ def _watch_alert(name, mint, hits):
         pass
     log.info(f"watch hit {name or mint} n={len(hits)}")
 
-def watch_coin(mint, creator=None, curve=None, name=None, s=None, src=""):
-    """Flag a new coin if a mapped top-10 address is the creator, early buyer, or their funder."""
+def watch_coin(mint, creator=None, curve=None, name=None, s=None, src="", extra=None):
+    """Instant Telegram if the creator (or their funder) is a watched winner dev. Then queue an early-buyer pass."""
     s = s or config.load()
-    idx = linked_index()
-    if not idx: return
-    hits = []
-    if creator:
-        recs = match_addr(creator, idx)
-        if recs: hits.append((creator, "creator", recs))
-        else:
-            try:
-                f = _funder(creator)
-            except Exception:
-                f = None
-            recs = match_addr(f, idx)
-            if recs: hits.append((f, "funder of creator", recs))
+    extra = dict(extra or {})
+    if name and not extra.get("name"): extra["name"] = name
+    cidx = creator_watch_index()
+    hits = hits_for_creator(creator, cidx)
+    if not hits and creator and cidx:
+        # brand-new dev wallets are usually 1-2 sigs; cheap and catches "funded by a watched creator"
+        try:
+            f = _funder(creator)
+        except Exception:
+            f = None
+        hits = hits_for_creator(creator, cidx, funder=f)
     if hits:
-        _watch_alert(name, mint, hits)
-    # always queue a delayed early-buyer pass (new coins are still young — shallow walk is enough)
+        send_creator_alert(name, mint, hits, extra)
+    # delayed early-buyer pass still uses the broader linked index (snipers etc.)
     with _pl:
-        _pending.append((time.time() + 25, mint, curve, creator, name))
+        _pending.append((time.time() + 25, mint, curve, creator, name, extra))
         if len(_pending) > 40: del _pending[:len(_pending) - 40]
 
 def _watch_new_pairs(s):
@@ -658,8 +981,20 @@ def _watch_new_pairs(s):
         watch_coin(m, s=s, src="new_pair")
         if len(seen) >= 25: break
 
+async def _sub_account_trades(w, subscribed):
+    keys = creator_watch_keys()
+    fresh = [k for k in keys if k not in subscribed]
+    # PumpPortal accepts a list of wallet addresses; chunk to stay well under message limits
+    for i in range(0, len(fresh), 50):
+        chunk = fresh[i:i+50]
+        await w.send(json.dumps({"method": "subscribeAccountTrade", "keys": chunk}))
+        subscribed.update(chunk)
+    if fresh:
+        log.info(f"ws subscribeAccountTrade +{len(fresh)} (total {len(subscribed)})")
+    return subscribed
+
 async def ws_loop(stop):
-    """PumpPortal new-token + migration stream (used when the old scanner is not running)."""
+    """PumpPortal new-token + migration stream, plus trades of watched creator wallets."""
     import websockets
     WS = "wss://pumpportal.fun/api/data"
     back = 1
@@ -668,31 +1003,84 @@ async def ws_loop(stop):
             async with websockets.connect(WS, ping_interval=30) as w:
                 await w.send(json.dumps({"method": "subscribeMigration"}))
                 await w.send(json.dumps({"method": "subscribeNewToken"}))
+                subscribed, last_rev = set(), -1
+                try:
+                    subscribed = await _sub_account_trades(w, subscribed)
+                    last_rev = _watch_rev[0]
+                except Exception as e:
+                    log.info(f"ws account trade sub {type(e).__name__}")
                 back = 1; log.info("ws connected")
                 while not stop.is_set():
-                    raw = await asyncio.wait_for(w.recv(), timeout=120)
+                    try:
+                        raw = await asyncio.wait_for(w.recv(), timeout=20)
+                    except asyncio.TimeoutError:
+                        if _watch_rev[0] != last_rev:
+                            try:
+                                subscribed = await _sub_account_trades(w, subscribed)
+                                last_rev = _watch_rev[0]
+                            except Exception as e:
+                                log.info(f"ws resub {type(e).__name__}")
+                        continue
                     m = json.loads(raw)
                     typ = m.get("txType")
+                    loop = asyncio.get_running_loop()
                     if typ == "create":
-                        asyncio.get_running_loop().run_in_executor(None, on_new_token, m)
+                        loop.run_in_executor(None, on_new_token, m)
                     elif typ == "migrate":
                         cr = m.get("traderPublicKey") or m.get("creator")
-                        asyncio.get_running_loop().run_in_executor(None, on_migration, m.get("mint"), cr)
+                        loop.run_in_executor(None, on_migration, m.get("mint"), cr)
+                    elif typ in ("buy", "sell"):
+                        loop.run_in_executor(None, on_account_trade, m)
+                    if _watch_rev[0] != last_rev:
+                        try:
+                            subscribed = await _sub_account_trades(w, subscribed)
+                            last_rev = _watch_rev[0]
+                        except Exception as e:
+                            log.info(f"ws resub {type(e).__name__}")
         except Exception as e:
             log.info(f"ws reconnect in {back}s ({type(e).__name__}: {e})")
             await asyncio.sleep(back); back = min(back * 2, 60)
+
+def _portal_extra(m):
+    mint = (m or {}).get("mint")
+    mc_sol = (m or {}).get("marketCapSol")
+    if mc_sol is None: mc_sol = (m or {}).get("vSolInBondingCurve")
+    return {"symbol": (m or {}).get("symbol"), "mc_sol": mc_sol,
+            "pump_origin": True if mint and (str(mint).endswith("pump") or (m or {}).get("txType") in ("create","buy","sell","migrate")) else bool(mint and str(mint).endswith("pump"))}
 
 def on_new_token(m):
     mint = m.get("mint"); creator = m.get("traderPublicKey") or m.get("creator")
     if not mint: return
     s = config.load()
     if not s.get("win_enabled", True): return
-    watch_coin(mint, creator=creator, curve=m.get("bondingCurveKey"), name=m.get("name"), s=s, src="create")
+    extra = _portal_extra(m)
+    # PumpPortal newToken is a pump.fun create
+    extra["pump_origin"] = True
+    watch_coin(mint, creator=creator, curve=m.get("bondingCurveKey"), name=m.get("name"), s=s, src="create", extra=extra)
 
 def on_migration(mint, creator):
     s = config.load()
     if not s.get("win_enabled", True) or not mint: return
-    watch_coin(mint, creator=creator, name=None, s=s, src="migrate")
+    watch_coin(mint, creator=creator, name=None, s=s, src="migrate", extra={"pump_origin": (mint or "").endswith("pump")})
+
+def on_account_trade(m):
+    """Optional path: a watched creator/dev buys a coin they did not already explode."""
+    typ = (m or {}).get("txType")
+    if typ != "buy": return
+    mint = m.get("mint")
+    trader = m.get("traderPublicKey") or m.get("trader") or m.get("wallet")
+    if not mint or not trader: return
+    s = config.load()
+    if not s.get("win_enabled", True): return
+    recs = creator_watch_index().get(trader) or []
+    # only "dev bought a new coin", not every funder trade
+    recs = [r for r in recs if (r.get("via") or r.get("role")) in ("creator", "dev", "cluster")]
+    if not recs: return
+    if any(r.get("mint") == mint for r in recs): return  # trading their own known winner
+    name = m.get("name")
+    extra = _portal_extra(m)
+    extra["pump_origin"] = extra.get("pump_origin") if extra.get("pump_origin") is not None else (mint or "").endswith("pump")
+    send_creator_alert(name, mint, [(trader, "dev buy", recs)], extra)
 
 def _drain_pending(s):
     now = time.time(); due = []
@@ -701,7 +1089,9 @@ def _drain_pending(s):
         for item in _pending:
             (due if item[0] <= now else keep).append(item)
         _pending[:] = keep[-40:]
-    for _, mint, curve, creator, name in due[:5]:
+    for item in due[:5]:
+        _, mint, curve, creator, name = item[:5]
+        extra = item[5] if len(item) > 5 else {}
         db.beat("winners")
         try:
             buyers, _st = _first_buyers(curve, time.time() - 60, s) if curve else ([], {})
@@ -718,7 +1108,7 @@ def _drain_pending(s):
                 recs = match_addr(f, idx)
                 if recs: hits.append((f, "funder of early buyer", recs))
         if hits:
-            _watch_alert(name, mint, hits)
+            _watch_alert(name, mint, hits, extra)
         for b in buyers:
             db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
                  (mint, b["addr"], "sniper", b["ts"]))
@@ -726,7 +1116,9 @@ def _drain_pending(s):
 def text():
     top = db.q("select * from winner_coins where coalesce(rank,0)>0 and coalesce(rug,0)=0 order by rank")
     uniq = db.q("select count(distinct addr) n from winner_roles", one=True)["n"]
-    lines = [f"Winners · top {len(top)} exploded (24h) · {uniq} linked wallets"]
+    nwatch = len(creator_watch_index())
+    days = int((config.load() or {}).get("win_watch_days", 7))
+    lines = [f"Winners · top {len(top)} exploded (24h) · {uniq} linked wallets · watching {nwatch} creator wallets ({days}d)"]
     if not top:
         lines.append("No top-10 list yet — waiting for the first mapping cycle.")
     for c in top:
@@ -746,11 +1138,21 @@ def loop(stop):
         t0 = time.time()
         try:
             _drain_pending(s)
-            db.beat("winners")
+            db.beat("winners", every=1)
+            try:
+                nfill = backfill_creators(s, budget_s=90)
+                log.info(f"backfill creators +{nfill}, watching {len(creator_watch_index())}")
+            except Exception as e:
+                log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
             log.info("discovering exploded pump coins")
             cands = discover(s)
             for row in cands: _save_coin(row, s)
             top = pick_top10(s, cands)
+            try:
+                nfill = backfill_creators(s, budget_s=30)
+                if nfill: log.info(f"backfill new ranked +{nfill}, watching {len(creator_watch_index())}")
+            except Exception as e:
+                log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
             log.info(f"found {len(cands)} candidates, mapping top {len(top)}")
             for row in top:
                 db.beat("winners")
@@ -769,7 +1171,8 @@ def loop(stop):
             try: _watch_new_pairs(s)
             except Exception as e: log.info(f"watch pairs {type(e).__name__}")
             _idx[0] = 0  # refresh linked-wallet cache
-            log.info(f"cycle top={len(top)} linked={len(linked_index())}")
+            _cidx[0] = 0
+            log.info(f"cycle top={len(top)} linked={len(linked_index())} creators={len(creator_watch_index())}")
         except util.Http429:
             log.info("cycle 429, backing off"); stop.wait(45)
         except Exception as e:

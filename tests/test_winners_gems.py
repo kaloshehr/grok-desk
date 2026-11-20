@@ -163,5 +163,59 @@ class TopTen(unittest.TestCase):
         ranked = sorted(rows, key=rank_key, reverse=True)
         self.assertEqual([r["name"] for r in ranked], ["c", "b", "a"])
 
+
+class CreatorWatch(unittest.TestCase):
+    def test_hits_for_creator(self):
+        from agents.winners import hits_for_creator
+        rec = {"mint": "Aaaapump", "name": "iAgent / SOL", "role": "dev", "via": "creator", "max_mult": 323, "rank": 1}
+        idx = {"CREATOR1": [rec], "FUNDER1": [{"mint": "Aaaapump", "name": "iAgent / SOL", "role": "funder", "via": "funder", "max_mult": 323, "rank": 1}]}
+        h = hits_for_creator("CREATOR1", idx)
+        self.assertEqual(h[0][1], "same creator")
+        self.assertEqual(h[0][0], "CREATOR1")
+        h = hits_for_creator("NEWWALLET", idx, funder="FUNDER1")
+        self.assertEqual(h[0][1], "funded by")
+        self.assertEqual(h[0][0], "FUNDER1")
+        h = hits_for_creator("FUNDER1", idx)
+        self.assertEqual(h[0][1], "is funder")
+        self.assertFalse(hits_for_creator("nobody", idx))
+
+    def test_format_creator_alert(self):
+        from agents.winners import format_creator_alert
+        import links
+        mint = "HF2RBPrfNBk9TxggL2cYZFEKSgirzh5HKCngLENTpump"
+        recs = [{"mint": "44DZsPNJUtUyTkELAFYdwCpe82sEt12HZKrMgK1Spump", "name": "iAgent / SOL", "max_mult": 323.22, "rank": 1, "via": "creator", "role": "dev"}]
+        hits = [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "same creator", recs)]
+        body = format_creator_alert("Cool Dog", mint, hits, {"symbol": "LOOSY", "mc_sol": 28.5, "pump_origin": True})
+        self.assertIn("PAPER · Winner creator: Cool Dog (LOOSY)", body)
+        self.assertIn("same creator as #1 iAgent / SOL (323x)", body)
+        self.assertIn("mint: " + mint, body)
+        self.assertIn("pump.fun origin", body)
+        self.assertIn("dev share n/a", body)
+        self.assertIn(links.coin_url(mint), body)
+        self.assertNotIn("ref=", body)
+        self.assertNotIn("utm_", body)
+        self.assertTrue(body.strip().endswith(links.coin_url(mint)))
+        funded = format_creator_alert("X", mint, [("FunderAddr11111111111111111111111111111", "funded by", recs)], {"pump_origin": True, "dev_pct": 4.2, "mc": 12000})
+        self.assertIn("funded by Fund…1111, funder of #1 iAgent / SOL (323x)", funded)
+        self.assertIn("MC $12,000", funded)
+        self.assertIn("dev share 4.2%", funded)
+        buy = format_creator_alert("Y", mint, [("ZXezTa6K1KEtbZwodqu6ScPWraVVdu1Y1AjotR5se5p", "dev buy", recs)])
+        self.assertIn("dev of #1 iAgent / SOL (323x) bought this coin", buy)
+
+    def test_already_alerted_memory(self):
+        from agents import winners
+        winners._alerted.clear()
+        mint = "DedupMint111111111111111111111111111111pump"
+        self.assertFalse(winners.already_alerted(mint))
+        winners._alerted["watch:" + mint] = __import__("time").time()
+        self.assertTrue(winners.already_alerted(mint))
+        winners._alerted.clear()
+
+    def test_watch_days_default(self):
+        import config
+        s = config.load()
+        self.assertEqual(int(s.get("win_watch_days", 7)), 7)
+
+
 if __name__ == "__main__":
     unittest.main()
