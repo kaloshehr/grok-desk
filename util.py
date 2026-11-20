@@ -34,6 +34,47 @@ class Http429(Exception): pass
 SOL_DEXES = {"pumpswap", "raydium", "meteora", "orca", "meteoradbc"}
 QUOTES = {"So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qJxNZoBmBFNdjYddw4ZQwKYsjv"}
 _dex_cache = {}; _dex_l = threading.Lock()
+
+def best_pair(pairs, mint=None):
+    """Highest-liquidity SOL/USDC pair. Prefer pumpswap/pumpfun only if it holds at least half of the deepest pool."""
+    usable = []
+    for p in pairs or []:
+        if (p.get("chainId") or "solana") != "solana": continue
+        if get(p, "quoteToken.address") not in QUOTES: continue
+        usable.append(p)
+    if not usable: return None
+    hi = max(usable, key=lambda p: get(p, "liquidity.usd") or 0)
+    hi_liq = get(hi, "liquidity.usd") or 0
+    canon = [p for p in usable if (p.get("dexId") or "").lower() in ("pumpswap", "pumpfun")]
+    if canon:
+        best_c = max(canon, key=lambda p: get(p, "liquidity.usd") or 0)
+        c_liq = get(best_c, "liquidity.usd") or 0
+        if c_liq >= 0.5 * hi_liq or hi_liq < 1000:
+            return best_c
+    return hi
+
+def pair_mc(p, mint=None):
+    """(usd, source). Use Dex marketCap when it agrees with price; for pump mints, price x 1B supply if Dex MC lags."""
+    if not p: return 0.0, "none"
+    def fnum(x):
+        try:
+            if x is None or x == "": return None
+            return float(x)
+        except Exception:
+            return None
+    price = fnum(p.get("priceUsd"))
+    mc = fnum(p.get("marketCap"))
+    fdv = fnum(p.get("fdv"))
+    computed = price * 1_000_000_000 if price and (mint or "").endswith("pump") else None
+    if computed:
+        ref = mc or fdv
+        if ref and abs(computed - ref) / max(computed, ref) <= 0.25:
+            return ref, "marketCap" if mc else "fdv"
+        return computed, "price x 1B supply"
+    if mc: return mc, "marketCap"
+    if fdv: return fdv, "fdv"
+    return 0.0, "unknown"
+
 def dex_tokens(mints, ttl=15, curve=False):
     """Returns {mint: best pumpswap pair}. Batches of 30. Per-mint cache `ttl` seconds (0 = no cache)."""
     out = {}; now = time.time(); need = []
@@ -49,13 +90,17 @@ def dex_tokens(mints, ttl=15, curve=False):
         if r.status_code == 429: _count("dex_429"); raise Http429()
         r.raise_for_status()
         got = {}
+        by = {}
         for p in r.json() or []:
             if p.get("chainId", "solana") != "solana" or (p.get("dexId") not in SOL_DEXES and not (curve and p.get("dexId") == "pumpfun")): continue
             if get(p, "quoteToken.address") not in QUOTES: continue
-            m = get(p, "baseToken.address"); o = out.get(m)
-            # prefer pumpswap pair (unchanged behaviour for migrations); else deepest pair on a Solana DEX
-            rank = lambda x: (x.get("dexId") == "pumpswap", get(x, "liquidity.usd") or 0)
-            if o is None or rank(p) > rank(o): out[m] = p; got[m] = p
+            m = get(p, "baseToken.address")
+            if not m: continue
+            by.setdefault(m, []).append(p)
+        for m, ps in by.items():
+            pick = best_pair(ps, m)
+            if pick:
+                out[m] = pick; got[m] = pick
         if curve: continue  # don't pollute the scanner cache with bonding-curve pairs
         with _dex_l:
             for m in need[i:i+30]: _dex_cache[m] = (time.time(), got.get(m))

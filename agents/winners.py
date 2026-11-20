@@ -800,9 +800,17 @@ def format_creator_alert(name, mint, hits, extra=None):
         safety += f" · dev share {dev:.1f}%" if dev is not None else " · dev share n/a"
     cap = None
     if mc:
-        cap = f"MC ${mc:,.0f}"
+        label = "FDV" if extra.get("mc_src") == "fdv" else "MC"
+        cap = f"{label} ${mc:,.0f}"
+        if extra.get("mc_src") == "price x 1B supply":
+            cap += " (price x 1B)"
+    elif extra.get("just_created"):
+        cap = "just created · still on pump.fun curve (Dex MC may lag)"
+        if mc_sol:
+            try: cap = f"just created · bonding ~{float(mc_sol):.1f} SOL (Dex MC may lag)"
+            except Exception: pass
     elif mc_sol:
-        try: cap = f"MC ~{float(mc_sol):.2f} SOL"
+        try: cap = f"bonding ~{float(mc_sol):.1f} SOL (not a Dex/FOMO MC)"
         except Exception: cap = None
     if cap and safety: lines.append(f"{cap} · {safety}")
     elif cap: lines.append(cap)
@@ -830,9 +838,51 @@ def mark_alerted(mint):
     try: db.kv_set(f"win_watch_alert:{mint}", time.time())
     except Exception: pass
 
-def send_creator_alert(name, mint, hits, extra=None):
+def enrich_live_mc(mint, extra=None):
+    """Attach a Dex-live USD MC when a pair exists, so Telegram matches FOMO."""
+    extra = dict(extra or {})
+    try:
+        p = (util.dex_tokens([mint], ttl=0, curve=True) or {}).get(mint)
+    except Exception:
+        p = None
+    if p:
+        mc, src = util.pair_mc(p, mint)
+        extra["mc"] = mc
+        extra["mc_src"] = src
+        extra["liq"] = util.get(p, "liquidity.usd") or 0
+        extra["dex"] = p.get("dexId")
+        extra.pop("just_created", None)
+    return extra
+
+def creator_alert_quality(hits, mint, extra, s=None):
+    """Same-creator / cluster alerts stay immediate. Funded-by needs a real pool, not a dead ~$2k curve."""
+    s = s or {}
+    hows = {h[1] for h in (hits or [])}
+    strong = hows & {"same creator", "creator", "dev", "same cluster", "cluster", "is funder", "funder created"}
+    extra = enrich_live_mc(mint, extra)
+    if not extra.get("mc") and extra.get("mc_sol") is not None:
+        extra["just_created"] = True
+    if strong:
+        return True, extra
+    # funded-by / loose links: skip dead bonding-curve leftovers
+    min_liq = s.get("gems_min_liq_usd", 8000)
+    mc = extra.get("mc") or 0
+    liq = extra.get("liq") or 0
+    dex = (extra.get("dex") or "")
+    if dex == "pumpfun" or not extra.get("mc"):
+        if mc < min_liq and liq < min_liq:
+            return False, extra
+    if mc >= min_liq or liq >= min_liq:
+        return True, extra
+    return False, extra
+
+def send_creator_alert(name, mint, hits, extra=None, s=None):
     """Immediate Telegram alert, deduped per mint. Alerts only — never feeds the executor."""
     if not mint or not hits or already_alerted(mint): return False
+    ok, extra = creator_alert_quality(hits, mint, extra, s or config.load())
+    if not ok:
+        log.info(f"creator alert skipped (quality) {name or mint[:6]}")
+        return False
     mark_alerted(mint)
     text = format_creator_alert(name, mint, hits, extra)
     notifier.send(text, notifier.fomo_btn(mint))
@@ -960,7 +1010,12 @@ def watch_coin(mint, creator=None, curve=None, name=None, s=None, src="", extra=
             f = None
         hits = hits_for_creator(creator, cidx, funder=f)
     if hits:
-        send_creator_alert(name, mint, hits, extra)
+        sent = send_creator_alert(name, mint, hits, extra, s=s)
+        # funded-by on a brand-new curve: retry once after Dex has a pair
+        if not sent and not extra.get("rechecked") and not already_alerted(mint):
+            extra = dict(extra); extra["rechecked"] = True
+            with _pl:
+                _pending.append((time.time() + 120, mint, curve, creator, name, extra, "creator_recheck"))
     # delayed early-buyer pass still uses the broader linked index (snipers etc.)
     with _pl:
         _pending.append((time.time() + 25, mint, curve, creator, name, extra))
@@ -1043,10 +1098,10 @@ async def ws_loop(stop):
 
 def _portal_extra(m):
     mint = (m or {}).get("mint")
+    # marketCapSol is a PumpPortal bonding figure, not a Dex/FOMO USD MC. Never use vSol reserves as MC.
     mc_sol = (m or {}).get("marketCapSol")
-    if mc_sol is None: mc_sol = (m or {}).get("vSolInBondingCurve")
-    return {"symbol": (m or {}).get("symbol"), "mc_sol": mc_sol,
-            "pump_origin": True if mint and (str(mint).endswith("pump") or (m or {}).get("txType") in ("create","buy","sell","migrate")) else bool(mint and str(mint).endswith("pump"))}
+    return {"symbol": (m or {}).get("symbol"), "mc_sol": mc_sol, "just_created": True,
+            "pump_origin": bool(mint and str(mint).endswith("pump"))}
 
 def on_new_token(m):
     mint = m.get("mint"); creator = m.get("traderPublicKey") or m.get("creator")
@@ -1092,7 +1147,12 @@ def _drain_pending(s):
     for item in due[:5]:
         _, mint, curve, creator, name = item[:5]
         extra = item[5] if len(item) > 5 else {}
+        kind = item[6] if len(item) > 6 else ""
         db.beat("winners")
+        if kind == "creator_recheck":
+            try: watch_coin(mint, creator=creator, curve=curve, name=name, s=s, src="recheck", extra=extra)
+            except Exception as e: log.info(f"recheck {mint} {type(e).__name__}")
+            continue
         try:
             buyers, _st = _first_buyers(curve, time.time() - 60, s) if curve else ([], {})
         except Exception as e:

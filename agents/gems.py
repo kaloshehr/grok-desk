@@ -16,12 +16,10 @@ UNSAFE_DEX = {"meteora", "meteoradbc"}
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 
 def is_pump_origin(mint, p=None, launchpad=None):
+    """True only for a pump.fun mint (address suffix) or a token still on the pump.fun curve.
+    Launchpad names like PumpSwap must not count — that tagged non-pump mints as origin."""
     if (mint or "").endswith("pump"): return True
-    if (p or {}).get("dexId") == "pumpfun": return True
-    if isinstance(launchpad, dict):
-        launchpad = " ".join(str(launchpad.get(k) or "") for k in ("name", "platform"))
-    if launchpad and "pump" in str(launchpad).lower().replace(".", "").replace(" ", ""):
-        return True
+    if ((p or {}).get("dexId") or "").lower() == "pumpfun": return True
     return False
 
 def is_true_graduation(mint, p, launchpad=None, now=None):
@@ -104,6 +102,17 @@ def blocked(sig, s=None):
     if sig.get("mutable"): return "mutable metadata"
     if s.get("gems_require_pump_origin", True) and not sig.get("pump_origin"): return "not pump.fun origin"
     if s.get("gems_require_lp_safe", True) and sig.get("lp_safe") is not True: return "LP not safe"
+    if sig.get("freeze_revoked") is False: return "freeze live"
+    if sig.get("already_exploded"): return "already exploded"
+    if sig.get("creator_rugs"): return "creator rugged"
+    if sig.get("bundles") is not None and sig["bundles"] >= 6: return "bundled"
+    min_liq = s.get("gems_min_liq_usd", 8000)
+    liq = sig.get("liq")
+    dex = (sig.get("dex") or "").lower()
+    if liq is not None and dex != "pumpfun" and liq < min_liq: return "low liq"
+    m5, h1 = sig.get("chg_m5"), sig.get("chg_h1")
+    if m5 is not None and m5 <= s.get("gems_max_dump_m5", -20): return "already dumping"
+    if h1 is not None and h1 <= s.get("gems_max_dump_h1", -30): return "already dumping"
     return None
 
 
@@ -239,9 +248,9 @@ def _cluster_bonus(mint, creator):
 
 def signals_from_pair(p, s, extra=None):
     extra = extra or {}
-    mc = float(p.get("marketCap") or p.get("fdv") or 0)
+    mc, mc_src = util.pair_mc(p, extra.get("mint") or (p or {}).get("baseToken", {}).get("address") if isinstance((p or {}).get("baseToken"), dict) else None)
     sig = {
-        "mc": mc, "min_mc": s["gems_min_mc_usd"], "max_mc": s["gems_max_mc_usd"],
+        "mc": mc, "mc_src": mc_src, "min_mc": s["gems_min_mc_usd"], "max_mc": s["gems_max_mc_usd"],
         "vol_acc": _vol_acc(p), "buy_share": _buy_share(p),
         "chg_m5": util.get(p, "priceChange.m5"), "chg_h1": util.get(p, "priceChange.h1"),
         "liq": util.get(p, "liquidity.usd") or 0,
@@ -251,6 +260,7 @@ def signals_from_pair(p, s, extra=None):
 
 def evaluate(mint, p, s, extra=None):
     extra = dict(extra or {})
+    extra.setdefault("mint", mint)
     sig = signals_from_pair(p, s, extra)
     sig["dex"] = (p or {}).get("dexId")
     sig["liq"] = sig.get("liq") if sig.get("liq") is not None else (util.get(p, "liquidity.usd") or 0)
@@ -289,6 +299,9 @@ def evaluate(mint, p, s, extra=None):
         if n and n["n"]: sig["creator_rugs"] = n["n"]
     already = db.q("select rug from gem_scores where mint=?", (mint,), True)
     if already and already["rug"]: sig["rugged"] = True
+    w = db.q("select max_mult,ath_mc,status,rug from winner_coins where mint=?", (mint,), True)
+    if w and ((w["max_mult"] or 0) >= 10 or (w["ath_mc"] or 0) >= 500000 or w["rug"] or w["status"] == "rug"):
+        sig["already_exploded"] = True
     sc, why = gem_score(sig)
     return sc, why, sig
 
@@ -322,12 +335,28 @@ def _candidates(s):
         seen.add(m); out.append((m, extra))
     return out[:80]
 
-def _alert(name, mint, sc, why, mc):
+def _live_mc(mint, fallback=0, pair=None):
+    """Refetch Dex at send time so the Telegram MC matches FOMO/Dex, not a stale cache."""
+    p = pair
+    try:
+        p = (util.dex_tokens([mint], ttl=0, curve=True) or {}).get(mint) or p
+    except Exception:
+        pass
+    mc, src = util.pair_mc(p, mint) if p else (fallback or 0, "cached")
+    return mc or fallback or 0, src, p
+
+def _alert(name, mint, sc, why, mc, pair=None):
     key = mint
     if time.time() - _alerted.get(key, 0) < 6 * 3600: return
     _alerted[key] = time.time()
-    notifier.send(f"PAPER · Early gem: {name or mint[:6]} · score {sc:.0f} · MC ${mc:,.0f}\n" + " · ".join(why[:6]) + f"\n{links.coin_url(mint)}",
+    live, src, p = _live_mc(mint, fallback=mc, pair=pair)
+    label = "MC" if src != "fdv" else "FDV"
+    notifier.send(f"PAPER · Early gem: {name or mint[:6]} · score {sc:.0f} · {label} ${live:,.0f}\n" + " · ".join(why[:6]) + f"\n{links.coin_url(mint)}",
                   notifier.fomo_btn(mint))
+    try:
+        db.q("update gem_scores set alert_mc=? where mint=?", (live, mint))
+    except Exception:
+        pass
     try:
         import bus; bus.activity(f"Early gem: {name or mint[:6]}", " · ".join(why[:4]), f"score {sc:.0f}", "info", mint)
     except Exception:
@@ -354,10 +383,10 @@ def consider(mint, s, extra=None, p=None, alert=True):
     prev = _persist(mint, name, sc, why, sig, p)
     why_block = blocked(sig, s)
     if alert and sc >= s["gems_alert_min_score"] and not why_block:
-        _alert(name, mint, sc, why, sig.get("mc") or 0)
+        _alert(name, mint, sc, why, sig.get("mc") or 0, pair=p)
         liq = sig.get("liq") or 0
         if not (prev and prev["alerted_at"]):
-            db.q("update gem_scores set alerted_at=?,alert_liq=? where mint=?", (time.time(), liq, mint))
+            db.q("update gem_scores set alerted_at=?,alert_liq=?,alert_mc=? where mint=?", (time.time(), liq, sig.get("mc") or 0, mint))
     if alert and sc >= s["gems_min_score"] and not why_block:
         from agents import winners
         winners._feed(mint, "gems", name)

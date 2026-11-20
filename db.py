@@ -47,7 +47,7 @@ def q(sql, args=(), one=False):
             _c.execute("create table if not exists gem_scores(mint text primary key,ts real,score real,mc real,name text,reasons text,json text)")
             _c.execute("create index if not exists i_wclusters_score on winner_clusters(score desc)")
             _c.execute("create index if not exists i_gems_ts on gem_scores(ts desc)")
-            for col in ("peak_liq real", "last_liq real", "alerted_at real", "alert_liq real", "rug int default 0", "rug_at real", "creator text", "dex text"):
+            for col in ("peak_liq real", "last_liq real", "alerted_at real", "alert_liq real", "alert_mc real", "rug int default 0", "rug_at real", "creator text", "dex text"):
                 try: _c.execute("alter table gem_scores add column " + col)
                 except Exception: pass
             for col in ("rank int", "walk_before text", "walk_done int default 0", "mapped_at real"):

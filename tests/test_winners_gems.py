@@ -85,7 +85,10 @@ class SafetyRules(unittest.TestCase):
         other = "HSXiByeLx2TUspPzL8GuF3XbTBiv2UKaALw4USdBn9Ce"
         self.assertTrue(is_pump_origin(pump))
         self.assertFalse(is_pump_origin(other))
-        self.assertTrue(is_pump_origin(other, launchpad={"name": "Pump.Fun", "platform": "pump_fun"}))
+        # launchpad / PumpSwap name is not enough (Flame Ingo-style non-pump suffix)
+        self.assertFalse(is_pump_origin(other, launchpad={"name": "Pump.Fun", "platform": "pump_fun"}))
+        self.assertFalse(is_pump_origin(other, {"dexId": "pumpswap"}, "PumpSwap"))
+        self.assertTrue(is_pump_origin(other, {"dexId": "pumpfun"}))  # still on the curve
         now = 1_000_000
         p = {"dexId": "pumpswap", "pairCreatedAt": (now - 600) * 1000}
         self.assertTrue(is_true_graduation(pump, p, now=now))
@@ -148,7 +151,38 @@ class SafetyRules(unittest.TestCase):
             "dev_pct": 2, "top10": 36, "pump_origin": True, "lp_safe": True, "lp_why": "PumpSwap canonical",
         })
         self.assertGreaterEqual(sc, 75)
-        self.assertIsNone(blocked({"pump_origin": True, "lp_safe": True, "mint_revoked": True, "dev_pct": 2}))
+        self.assertIsNone(blocked({"pump_origin": True, "lp_safe": True, "mint_revoked": True, "dev_pct": 2, "liq": 15000, "chg_m5": 24}))
+
+    def test_new_quality_blocks(self):
+        from agents.gems import blocked
+        s = {"gems_require_pump_origin": True, "gems_require_lp_safe": True, "gems_min_liq_usd": 8000, "gems_max_dump_m5": -20, "gems_max_dump_h1": -30}
+        ok = {"pump_origin": True, "lp_safe": True, "mint_revoked": True, "freeze_revoked": True, "liq": 15000, "chg_m5": 10, "dex": "pumpswap"}
+        self.assertIsNone(blocked(ok, s))
+        self.assertEqual(blocked({**ok, "liq": 4533}, s), "low liq")  # Chinese Inu-like
+        self.assertEqual(blocked({**ok, "chg_m5": -78}, s), "already dumping")
+        self.assertEqual(blocked({**ok, "already_exploded": True}, s), "already exploded")  # OFFICIALGTA-like
+        self.assertEqual(blocked({**ok, "creator_rugs": 2}, s), "creator rugged")
+        self.assertEqual(blocked({**ok, "pump_origin": False}, s), "not pump.fun origin")
+
+    def test_pair_mc_and_best_pair(self):
+        from util import pair_mc, best_pair
+        # Dex MC lags price after a crash (Chinese Inu-like)
+        p = {"priceUsd": "0.00000336", "marketCap": 6265, "fdv": 6265, "liquidity": {"usd": 4500}}
+        mc, src = pair_mc(p, "Aaaapump")
+        self.assertAlmostEqual(mc, 3360, delta=20)
+        self.assertEqual(src, "price x 1B supply")
+        # Dex MC agrees with price (OFFICIALGTA-like)
+        p2 = {"priceUsd": "0.00014966", "marketCap": 149660, "fdv": 149660}
+        mc, src = pair_mc(p2, "Bbbbpump")
+        self.assertEqual(mc, 149660)
+        self.assertEqual(src, "marketCap")
+        dry_ps = {"dexId": "pumpswap", "chainId": "solana", "liquidity": {"usd": 50},
+                  "quoteToken": {"address": "So11111111111111111111111111111111111111112"}}
+        deep = {"dexId": "raydium", "chainId": "solana", "liquidity": {"usd": 20000},
+                "quoteToken": {"address": "So11111111111111111111111111111111111111112"}}
+        self.assertEqual(best_pair([dry_ps, deep])["dexId"], "raydium")
+        fat_ps = dict(dry_ps, liquidity={"usd": 18000})
+        self.assertEqual(best_pair([fat_ps, deep])["dexId"], "pumpswap")
 
 
 
