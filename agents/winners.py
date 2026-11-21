@@ -920,36 +920,148 @@ def _record_role(mint, addr, role, ts=None):
     db.q("insert or ignore into winner_roles(mint,addr,role,buy_ts,sell_ts,hold_s,usd) values(?,?,?,?,null,null,null)",
          (mint, addr, role, ts))
 
-def top_holders(mint, extra_skip=None, ttl=3600):
-    """Top token-account owners for a mint via getTokenLargestAccounts. Cached. No I/O in tests if monkeypatched."""
-    if not mint: return []
-    k = f"holders:{mint}"
-    hit = db.kv_get(k)
-    if hit and time.time() - hit.get("t", 0) < ttl:
-        return [h for h in (hit.get("holders") or []) if not is_ignored_addr(h, extra_skip)]
-    db.beat("winners", every=1)
-    try:
-        res = util.research_rpc("getTokenLargestAccounts", [mint], ttl=ttl) or {}
-    except Exception as e:
-        log.info(f"holders {mint[:6]} {type(e).__name__}")
-        return []
-    accs = [a.get("address") for a in (res.get("value") or []) if a.get("address")]
-    if not accs: return []
-    db.beat("winners", every=1)
-    try:
-        info = util.research_rpc("getMultipleAccounts", [accs, {"encoding": "jsonParsed"}], ttl=ttl) or {}
-    except Exception as e:
-        log.info(f"holders parse {mint[:6]} {type(e).__name__}")
-        return []
+def pool_addrs_from_report(rep):
+    """Collect AMM/pool/vault addresses from a rugcheck report. Pure, no I/O."""
+    out = set()
+    if not rep: return out
+    def eat(x):
+        if isinstance(x, str) and 32 <= len(x) <= 44: out.add(x)
+        elif isinstance(x, dict):
+            for k, v in x.items():
+                kl = k.lower()
+                if kl in ("pubkey", "address", "owner", "pool", "market", "lpmint", "lp_mint") or "address" in kl or kl.endswith("mint") or kl.endswith("key"):
+                    eat(v)
+                elif k in ("liquidityAAccount", "liquidityBAccount", "mintAAccount", "mintBAccount", "mintLPAccount", "lp"):
+                    eat(v)
+        elif isinstance(x, list):
+            for i in x: eat(i)
+    eat(rep.get("markets") or [])
+    return out
+
+def holders_from_report(rep, extra_skip=None):
+    """Wallet owners from rugcheck topHolders, minus pools/programs. Pure, no I/O."""
+    extra = set(extra_skip or ())
+    extra |= pool_addrs_from_report(rep)
     owners, seen = [], set()
-    for acc in (info.get("value") or []):
+    for h in rep.get("topHolders") or []:
+        if not isinstance(h, dict): continue
+        owner = h.get("owner") or h.get("address")
+        if not owner or owner in seen or is_ignored_addr(owner, extra): continue
+        seen.add(owner); owners.append(owner)
+    return owners
+
+def map_skip_reason(mint, liq=None, name=None, symbol=None):
+    """Skip zero-liquidity non-pump mints (TTWO/ANT-style Dex artifacts). Pure."""
+    if is_quote_mint(mint, symbol, name): return "quote"
+    pump = bool(mint and str(mint).endswith("pump"))
+    try:
+        liq_n = None if liq is None else float(liq)
+    except Exception:
+        liq_n = None
+    if liq_n is not None and liq_n <= 0 and not pump:
+        return "zero-liq"
+    return None
+
+def map_sort_key(coin, liq=None):
+    """Lower is mapped first: pump+liq, then other pump, then the rest, by ATH desc."""
+    mint = coin.get("mint") or ""
+    pump = mint.endswith("pump")
+    try: liq_n = None if liq is None else float(liq)
+    except Exception: liq_n = None
+    skip = map_skip_reason(mint, liq_n, coin.get("name"), coin.get("symbol"))
+    if skip: bucket = 4
+    elif pump and liq_n is not None and liq_n > 0: bucket = 0
+    elif pump: bucket = 1
+    elif liq_n is not None and liq_n > 0: bucket = 2
+    else: bucket = 3
+    return (bucket, -(coin.get("ath_mc") or 0))
+
+def _owners_from_largest(res, accounts_info=None, extra_skip=None):
+    """Parse getTokenLargestAccounts + optional getMultipleAccounts. Pure."""
+    accs = [a.get("address") for a in (res.get("value") or []) if isinstance(a, dict) and a.get("address")]
+    if not accs: return [], accs
+    if not accounts_info:
+        return [], accs
+    owners, seen = [], set()
+    for acc in (accounts_info.get("value") or []):
         if not acc: continue
         parsed = (((acc.get("data") or {}).get("parsed") or {}).get("info") or {})
         owner = parsed.get("owner")
         if not owner or owner in seen or is_ignored_addr(owner, extra_skip): continue
         seen.add(owner); owners.append(owner)
-    try: db.kv_set(k, {"t": time.time(), "holders": owners})
-    except Exception: pass
+    return owners, accs
+
+def _owners_from_das(res, extra_skip=None):
+    """Parse Helius DAS getTokenAccounts. Pure."""
+    if not res: return []
+    accs = []
+    if isinstance(res, dict):
+        accs = res.get("token_accounts") or res.get("items") or res.get("value") or []
+        if isinstance(accs, dict): accs = accs.get("token_accounts") or accs.get("items") or []
+    elif isinstance(res, list):
+        accs = res
+    owners, seen = [], set()
+    for a in accs:
+        if isinstance(a, str):
+            owner = a
+        elif isinstance(a, dict):
+            owner = a.get("owner") or (a.get("account") or {}).get("owner") or a.get("address")
+        else:
+            continue
+        if not owner or owner in seen or is_ignored_addr(owner, extra_skip): continue
+        seen.add(owner); owners.append(owner)
+    return owners
+
+def top_holders(mint, extra_skip=None, ttl=3600):
+    """Top holders: getTokenLargestAccounts, then DAS getTokenAccounts, then rugcheck topHolders."""
+    if not mint: return []
+    k = f"holders:{mint}"
+    hit = db.kv_get(k)
+    if hit and time.time() - hit.get("t", 0) < ttl and hit.get("holders"):
+        return [h for h in (hit.get("holders") or []) if not is_ignored_addr(h, extra_skip)]
+    owners, why = [], []
+    db.beat("winners", every=1)
+    # 1) classic SPL largest-accounts (often 429 on public; Token-2022 may be unsupported)
+    try:
+        res = util.research_rpc("getTokenLargestAccounts", [mint], ttl=ttl, timeout=8) or {}
+        accs = [a.get("address") for a in (res.get("value") or []) if isinstance(a, dict) and a.get("address")]
+        if accs:
+            db.beat("winners", every=1)
+            try:
+                info = util.research_rpc("getMultipleAccounts", [accs, {"encoding": "jsonParsed"}], ttl=ttl, timeout=10) or {}
+            except Exception as e:
+                why.append(f"largest-parse {type(e).__name__}")
+                info = None
+            if info:
+                owners, _ = _owners_from_largest(res, info, extra_skip)
+    except Exception as e:
+        why.append(f"largest {type(e).__name__}")
+    # 2) Helius DAS — works for Token-2022 pump.fun mints when the key still has quota
+    if not owners:
+        db.beat("winners", every=1)
+        try:
+            das = util.research_rpc("getTokenAccounts", {"mint": mint, "limit": 20, "page": 1}, ttl=ttl, timeout=10)
+            owners = _owners_from_das(das, extra_skip)
+            if not owners:
+                why.append("das empty")
+        except Exception as e:
+            why.append(f"das {type(e).__name__}")
+    # 3) rugcheck topHolders (public, includes Token-2022). Markets used to drop LP vaults.
+    if not owners:
+        db.beat("winners", every=1)
+        try:
+            rep = util.rugcheck(mint, ttl=max(ttl, 300)) or {}
+            extra = set(extra_skip or ()) | pool_addrs_from_report(rep)
+            owners = holders_from_report(rep, extra)
+            if not owners:
+                why.append("rugcheck empty")
+        except Exception as e:
+            why.append(f"rugcheck {type(e).__name__}")
+    if owners:
+        try: db.kv_set(k, {"t": time.time(), "holders": owners})
+        except Exception: pass
+    else:
+        log.info(f"holders {mint[:6]} empty ({', '.join(why) or 'no source'})")
     return owners
 
 def _counterparties(addr, mint, known, limit=6):
@@ -1000,12 +1112,16 @@ def map_bubble(mint, s=None, deadline=None, coin=None):
     if creator:
         record_creator(mint, creator, coin.get("name"), coin.get("launched_at"))
         extra_skip.add(mint)
-    holders = []
-    if deadline is None or time.time() < deadline:
+    coin_deadline = time.time() + 75
+    if deadline is not None:
+        coin_deadline = min(coin_deadline, deadline)
+    holders, holder_err = [], False
+    if time.time() < coin_deadline:
         try:
             holders = top_holders(mint, extra_skip=extra_skip)
         except Exception as e:
-            log.info(f"bubble holders {mint[:6]} {type(e).__name__}")
+            holder_err = True
+            log.info(f"bubble holders {mint[:6]} {type(e).__name__}: {config.redact(e)}")
             holders = []
     for h in holders:
         _record_role(mint, h, "holder", coin.get("launched_at"))
@@ -1016,7 +1132,7 @@ def map_bubble(mint, s=None, deadline=None, coin=None):
     funder_of, pairs = {}, []
     # funders (cached). Cap to keep the 30 rpc/min budget healthy.
     for addr in wallets[:16]:
-        if deadline is not None and time.time() >= deadline: break
+        if time.time() >= coin_deadline: break
         try:
             f = _funder(addr)
         except Exception:
@@ -1038,7 +1154,7 @@ def map_bubble(mint, s=None, deadline=None, coin=None):
     # a few recent transfer links among the same set
     known = set(wallets) | set(funder_of.values())
     for addr in wallets[:8]:
-        if deadline is not None and time.time() >= deadline: break
+        if time.time() >= coin_deadline: break
         try:
             for other in _counterparties(addr, mint, known, limit=5):
                 if not is_ignored_addr(other, extra_skip):
@@ -1062,7 +1178,9 @@ def map_bubble(mint, s=None, deadline=None, coin=None):
             for addr in g:
                 if is_ignored_addr(addr, extra_skip): continue
                 _record_role(mint, addr, "cluster")
-    done = bool(creator or holders)
+    # Only mark done when we actually got a holder set. A failed fetch (429 / usage cap)
+    # must not retire the coin, or a zero-liq first item blocks the rest of the queue.
+    done = bool(holders) and not holder_err
     try:
         db.q("update winner_coins set bubble_done=?,bubble_at=?,creator=coalesce(?,creator) where mint=?",
              (int(done), time.time(), creator, mint))
@@ -1071,33 +1189,57 @@ def map_bubble(mint, s=None, deadline=None, coin=None):
     _cidx[0] = 0
     _watch_rev[0] += 1
     n = len({a for a in (wallets + list(funder_of.values()) + [x for pr in pairs for x in pr]) if a})
-    log.info(f"bubble {coin.get('name') or mint[:6]} creator={(creator or '')[:6]} holders={len(holders)} links={len(pairs)} wallets~{n}")
+    log.info(f"bubble {coin.get('name') or mint[:6]} creator={(creator or '')[:6]} holders={len(holders)} links={len(pairs)} wallets~{n} done={int(done)}")
     return done
 
 def map_million_bubbles(s, budget_s=600):
-    """Incrementally map unmapped $1M coins. Respects RPC 429 / research budget."""
+    """Incrementally map unmapped $1M coins. Pump+liq first. A failure does not stall the queue."""
     start = time.time()
     deadline = start + budget_s
     coins = [rowd(c) for c in watch_coins(s)]
-    # unmapped first, then stale (>12h)
+    liq_of = {}
+    need = [c["mint"] for c in coins if c.get("mint") and not c.get("bubble_done")]
+    if need:
+        try:
+            db.beat("winners", every=1)
+            pairs = util.dex_tokens(need[:60], ttl=60, curve=True) or {}
+            for m, p in pairs.items():
+                liq_of[m] = util.get(p, "liquidity.usd")
+        except Exception as e:
+            log.info(f"bubble liq {type(e).__name__}")
     def stale(c):
-        if not c.get("bubble_done"): return 0
+        if c.get("bubble_done"):
+            at = c.get("bubble_at") or 0
+            return 2 if not (at and time.time() - at > 12 * 3600) else 1
         at = c.get("bubble_at") or 0
-        return 1 if at and time.time() - at > 12 * 3600 else 2
-    coins = sorted(coins, key=lambda c: (stale(c), -(c.get("ath_mc") or 0)))
+        # recent failed attempt: try later, after fresh coins
+        if at and time.time() - at < 15 * 60: return 3
+        return 0
+    coins = sorted(coins, key=lambda c: (stale(c),) + map_sort_key(c, liq_of.get(c.get("mint"))))
     n = 0
     for c in coins:
         if time.time() >= deadline: break
-        if stale(c) == 2: break
+        mint = c.get("mint")
+        why = map_skip_reason(mint, liq_of.get(mint), c.get("name"), c.get("symbol"))
+        if why:
+            # do not spend RPC; leave bubble_done=0 so a later liq appearance can qualify, but stamp bubble_at
+            if not c.get("bubble_done"):
+                log.info(f"bubble skip {c.get('name') or (mint or '')[:6]} ({why})")
+                try: db.q("update winner_coins set bubble_at=? where mint=? and coalesce(bubble_done,0)=0", (time.time(), mint))
+                except Exception: pass
+            continue
+        if c.get("bubble_done") and stale(c) == 2:
+            continue
         db.beat("winners", every=1)
         try:
-            if map_bubble(c["mint"], s, deadline=deadline, coin=c):
+            if map_bubble(mint, s, deadline=min(deadline, time.time() + 75), coin=c):
                 n += 1
         except util.Http429:
-            log.info("bubble 429, pause mapping")
-            break
+            log.info(f"bubble 429 on {mint[:6]}, continue")
+            continue
         except Exception as e:
-            log.info(f"bubble {c['mint'][:6]} {type(e).__name__}: {config.redact(e)}")
+            log.info(f"bubble {mint[:6]} {type(e).__name__}: {config.redact(e)}")
+            continue
     return n
 
 def watch_coins(s=None):
@@ -1659,7 +1801,7 @@ def loop(stop):
             _drain_pending(s)
             db.beat("winners", every=1)
             try:
-                nfill = backfill_creators(s, budget_s=90)
+                nfill = backfill_creators(s, budget_s=40)
                 log.info(f"backfill creators +{nfill}, watching {len(creator_watch_index())}")
             except Exception as e:
                 log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
@@ -1668,11 +1810,12 @@ def loop(stop):
             for row in cands: _save_coin(row, s)
             coins = watch_coins(s)
             try:
-                nfill = backfill_creators(s, budget_s=45)
+                nfill = backfill_creators(s, budget_s=20)
                 if nfill: log.info(f"backfill $1M creators +{nfill}")
             except Exception as e:
                 log.info(f"backfill {type(e).__name__}: {config.redact(e)}")
-            left = max(30, 12 * 60 - (time.time() - t0))
+            # Always leave a real mapping window, even if backfill/discover ran long.
+            left = max(180, min(10 * 60, 12 * 60 - (time.time() - t0)))
             try:
                 nm = map_million_bubbles(s, budget_s=left)
                 log.info(f"mapped bubbles +{nm}")

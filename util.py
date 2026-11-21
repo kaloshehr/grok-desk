@@ -130,7 +130,12 @@ def rpc(url, method, params, timeout=30):
         try: r = requests.post(url, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=timeout)
         except Exception as e: raise RuntimeError(f"[rpc] {method} {type(e).__name__}") from None
         if r.status_code != 429: break
-        _count("rpc_429"); RPC_SP.backoff(2 ** attempt)
+        body = (r.text or "")[:80].lower()
+        _count("rpc_429")
+        # plan/credit cap: retrying for minutes just stalls every agent
+        if "max usage" in body or "usage reached" in body or "credits" in body:
+            raise RuntimeError(f"[rpc] {method} HTTP 429 usage cap")
+        RPC_SP.backoff(2 ** attempt)
     if r.status_code != 200: raise RuntimeError(f"[rpc] {method} HTTP {r.status_code}")
     j = r.json()
     if "error" in j: raise RuntimeError(f"rpc {method}: {j['error']}")

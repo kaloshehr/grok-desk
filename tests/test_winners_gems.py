@@ -300,5 +300,58 @@ class CreatorWatch(unittest.TestCase):
         winners._alerted.clear()
 
 
+class BubbleMap(unittest.TestCase):
+    def test_holders_from_report_drops_pools(self):
+        from agents.winners import holders_from_report, pool_addrs_from_report, is_ignored_addr
+        pool = "Bfiq9eaLcMjpEKcgm16GSzzGdedCpcFhRAFvivRP4QkY"
+        wallet = "9SB8yCeS6aCohhGvrXcmZcV8iziFEa84767UCPLu5HsW"
+        rep = {
+            "topHolders": [
+                {"owner": pool, "pct": 91.9},
+                {"owner": wallet, "pct": 2.0},
+                {"owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "pct": 0.1},
+            ],
+            "markets": [{"pubkey": pool, "lp": {"lpMint": "CyzrkP3ZMnthJdqE9YZrK41Gf4UNzaMFVifBmE4wBZo1"}}],
+        }
+        self.assertIn(pool, pool_addrs_from_report(rep))
+        self.assertEqual(holders_from_report(rep), [wallet])
+        self.assertTrue(is_ignored_addr("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"))
+
+    def test_owners_from_das(self):
+        from agents.winners import _owners_from_das
+        res = {"token_accounts": [
+            {"owner": "WalletA111111111111111111111111111111111", "amount": 10},
+            {"owner": "WalletA111111111111111111111111111111111", "amount": 1},
+            {"owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "amount": 2},
+            {"owner": "WalletB111111111111111111111111111111111", "amount": 3},
+        ]}
+        self.assertEqual(_owners_from_das(res), [
+            "WalletA111111111111111111111111111111111",
+            "WalletB111111111111111111111111111111111",
+        ])
+
+    def test_map_order_prefers_pump_with_liq(self):
+        from agents.winners import map_skip_reason, map_sort_key
+        self.assertEqual(map_skip_reason("CptDkxR8rV68ngdh2JgFdSodu2KQSmyNEyyin9RdWZp1", 0, "TTWO / SOL", "TTWO"), "zero-liq")
+        self.assertIsNone(map_skip_reason("B34nXKzCgsJb9ChLuSHPRpXLE3WFSWyeT8Cqkzzmpump", 20000))
+        self.assertIsNone(map_skip_reason("B34nXKzCgsJb9ChLuSHPRpXLE3WFSWyeT8Cqkzzmpump", 0))
+        coins = [
+            {"mint": "TTWOxxxxnotpumpxxxxxxxxxxxxxxxxxxxxxx", "name": "TTWO", "ath_mc": 20_000_000},
+            {"mint": "Aaaapump", "name": "FIONA", "ath_mc": 3_000_000},
+            {"mint": "Bbbbpump", "name": "RINGS", "ath_mc": 2_800_000},
+            {"mint": "Ccccpump", "name": "LOOSY", "ath_mc": 2_500_000},
+        ]
+        liq = {"Aaaapump": 50000, "Ccccpump": 2000, "TTWOxxxxnotpumpxxxxxxxxxxxxxxxxxxxxxx": 0}
+        ordered = sorted(coins, key=lambda c: map_sort_key(c, liq.get(c["mint"])))
+        self.assertEqual([c["name"] for c in ordered], ["FIONA", "LOOSY", "RINGS", "TTWO"])
+
+    def test_rescore_is_batched(self):
+        import inspect
+        from agents.gems import rescore_existing
+        sig = inspect.signature(rescore_existing)
+        self.assertIn("limit", sig.parameters)
+        self.assertIn("budget_s", sig.parameters)
+
+
 if __name__ == "__main__":
     unittest.main()

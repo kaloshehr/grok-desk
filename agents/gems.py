@@ -442,32 +442,48 @@ def watch_alerted(s, pairs=None):
                 n += 1
     return n
 
-def rescore_existing(s=None, alert=False):
-    """Re-score rows already in gem_scores with current safety rules. Returns list of result dicts."""
+def rescore_existing(s=None, alert=False, limit=12, budget_s=25):
+    """Re-score a batch of stored gem_scores. Time-boxed so the gems loop keeps beating."""
     s = s or config.load()
-    rows = db.q("select * from gem_scores")
+    rows = db.q("select * from gem_scores order by ts desc")
     if not rows: return []
-    try: pairs = util.dex_tokens([r["mint"] for r in rows], ttl=0, curve=True)
+    cursor = 0
+    try: cursor = int(db.kv_get("gems_rescore_cursor") or 0)
+    except Exception: cursor = 0
+    if cursor >= len(rows): cursor = 0
+    batch = rows[cursor:cursor + max(1, int(limit))]
+    try: pairs = util.dex_tokens([r["mint"] for r in batch], ttl=30, curve=True)
     except Exception as e:
         log.info(f"rescore dex {type(e).__name__}"); pairs = {}
     out = []
-    for r in rows:
-        db.beat("gems")
+    t0 = time.time()
+    for r in batch:
+        db.beat("gems", every=1)
+        if time.time() - t0 >= budget_s:
+            break
         p = pairs.get(r["mint"])
-        extra = {"name": r["name"], "creator": r["creator"]}
+        extra = {"name": r["name"], "creator": r["creator"], "skip_deep": True}
         if not p:
             out.append({"name": r["name"], "mint": r["mint"], "score": 0, "pass": False, "why": "no pair", "block": "no pair"})
             continue
         try:
-            sc, why, sig, block = consider(r["mint"], s, extra, p, alert=alert)
+            got = consider(r["mint"], s, extra, p, alert=alert)
         except Exception as e:
             out.append({"name": r["name"], "mint": r["mint"], "score": None, "pass": False, "why": type(e).__name__, "block": "error"})
             continue
+        if not got:
+            out.append({"name": r["name"], "mint": r["mint"], "score": 0, "pass": False, "why": "no pair", "block": "no pair"})
+            continue
+        sc, why, sig, block = got
         ok = sc >= s["gems_min_score"] and not block
         out.append({"name": r["name"], "mint": r["mint"], "score": sc, "pass": ok, "alert": sc >= s["gems_alert_min_score"] and not block,
                     "why": " · ".join(why), "block": block, "dex": sig.get("dex"), "liq": sig.get("liq"),
                     "lp_safe": sig.get("lp_safe"), "pump_origin": sig.get("pump_origin"), "rugged": sig.get("rugged")})
-    watch_alerted(s, pairs)
+    nxt = cursor + len(batch)
+    if nxt >= len(rows): nxt = 0
+    try: db.kv_set("gems_rescore_cursor", nxt)
+    except Exception: pass
+    log.info(f"rescore batch {cursor}+{len(out)}/{len(rows)}")
     return out
 
 def on_new_token(m):
@@ -497,12 +513,11 @@ def loop(stop):
                 if n: log.info(f"watch marked {n} rugs")
             except Exception as e:
                 log.info(f"watch {type(e).__name__}: {config.redact(e)}")
-            if first:
-                try:
-                    log.info("rescoring stored gems with LP/origin rules")
-                    rescore_existing(s, alert=False)
-                except Exception as e:
-                    log.info(f"rescore {type(e).__name__}: {config.redact(e)}")
+            try:
+                log.info("rescoring stored gems batch")
+                rescore_existing(s, alert=False, limit=12, budget_s=20)
+            except Exception as e:
+                log.info(f"rescore {type(e).__name__}: {config.redact(e)}")
             log.info("scoring cheap early-breakout coins")
             cands = _candidates(s)
             # batch dex lookups
